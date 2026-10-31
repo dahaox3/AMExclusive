@@ -1,0 +1,1 @@
+target_sources(am_exclusive_hook PRIVATE src/output_device/EndpointRedirect.cpp)

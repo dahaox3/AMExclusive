@@ -176,3 +176,5 @@ am_add_version_info(am_exclusive_ui "am-exclusive-ui.dll" "AMExclusive user inte
 am_add_version_info(am_exclusive_media_control "am_exclusive_media_control.exe" "AMExclusive media session control" "AMExclusive 媒体会话控制" VFT_APP)
 am_add_version_info(am_exclusive_broker "am-exclusive-broker.exe" "AMExclusive Apple Music companion" "AMExclusive Apple Music 伴生程序" VFT_APP)
 am_add_version_info(am_exclusive_setup "AMExclusive-Setup.exe" "AMExclusive installer" "AMExclusive 安装程序" VFT_APP)
+
+include("${CMAKE_CURRENT_LIST_DIR}/src/output_device/CMakeLists.txt" OPTIONAL)
