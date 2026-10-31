@@ -1067,6 +1067,9 @@ int wmain() {
     g_status.hardwareBufferMs = ReadHardwareBufferMs();
     g_status.allowResampling = ReadAllowResampling() ? 1 : 0;
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
+    // output-device-selector: exclusive intent must not survive a broker restart; kept as an override so the upstream lines above stay untouched.
+    g_status.enabledIntent = 0;
+    g_status.state = RuntimeState::Off;
     Log(L"companion started pid=" + std::to_wstring(GetCurrentProcessId()) +
         L" persistedIntent=" + std::to_wstring(g_status.enabledIntent) +
         L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs) +
