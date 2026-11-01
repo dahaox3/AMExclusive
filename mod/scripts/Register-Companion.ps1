@@ -10,6 +10,19 @@ function Get-InstallerText([string]$Chinese, [string]$English) {
     if ($script:ameChinese) { return $Chinese }
     return $English
 }
+
+function Get-RegisteredTaskPrincipalSid([string]$TaskXml) {
+    # The COM Principal.UserId getter can return an unqualified display name.
+    # When the computer and account share that name, NTAccount translation can
+    # resolve the computer instead (or fail). XML preserves the registered SID;
+    # never round-trip it through a localized/renamed machine/account name.
+    [xml]$xml = $TaskXml
+    $user = $xml.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Principals']/*[local-name()='Principal']/*[local-name()='UserId']")
+    if (-not $user -or $user.InnerText -notmatch '^S-1-') {
+        throw (Get-InstallerText '计划任务 XML 缺少账户 SID，无法验证安装账户。' 'The task XML has no account SID; the installation account could not be verified.')
+    }
+    return ([Security.Principal.SecurityIdentifier]::new($user.InnerText)).Value
+}
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $install = [IO.Path]::GetFullPath($InstallDirectory)
 if ($install -ne [IO.Path]::GetFullPath((Join-Path $env:PUBLIC 'AMExclusive'))) {
@@ -49,11 +62,7 @@ $registered = $folder.RegisterTaskDefinition($taskName, $task, 6, $sid, $null, 3
 # Read back the persisted task, including the event and lifetime policy.
 $registered = $folder.GetTask($taskName)
 $definition = $registered.Definition
-$registeredPrincipal = $definition.Principal.UserId
-if ($registeredPrincipal -notmatch '^S-1-') {
-    $registeredPrincipal = (New-Object Security.Principal.NTAccount($registeredPrincipal)).Translate(
-        [Security.Principal.SecurityIdentifier]).Value
-}
+$registeredPrincipal = Get-RegisteredTaskPrincipalSid -TaskXml $registered.Xml
 if (-not $registered.Enabled -or $definition.Actions.Count -ne 1 -or
     $definition.Actions.Item(1).Path -ne $broker -or
     $definition.Actions.Item(1).WorkingDirectory -ne $install -or

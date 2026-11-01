@@ -91,6 +91,9 @@ public:
     HRESULT Open(const WasapiSinkConfig& config) noexcept;
     HRESULT Start(IIntegerPcmSource& source) noexcept;
     void Pause() noexcept;
+    // Stop consuming the source, drain only PCM already handed to the driver,
+    // then release all endpoint interfaces. The source itself stays untouched.
+    HRESULT DrainAndClose() noexcept;
     void Stop() noexcept;
     void Close() noexcept;
 

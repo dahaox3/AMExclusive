@@ -1,5 +1,31 @@
 # WASAPI drain hardware regression probe
 
+## Fork regression checks
+
+`ctest --test-dir <build-directory> -C Release --output-on-failure` runs the
+Agent election/quality/callback tests and the PowerShell installer SID tests.
+They do not acquire audio endpoints or modify scheduled tasks.
+
+Build `am_exclusive_endpoint_lease_probe` explicitly. Use `--list-devices`, then
+`--run-on-endpoint <endpoint-ID>` on an idle endpoint. It sends silence and
+checks pause/release, a real shared video-style client (including a still-open
+client on music resume), another exclusive owner, retry without consuming
+queued music, and resume without a fresh producer block. The 48 kHz/16-bit,
+44.1 kHz/24-bit and 96 kHz/24-bit source cases each run three cycles. This was
+verified on an NVIDIA display-audio endpoint; TOPPING and Apple Music UI
+integration require separate device/application validation.
+
+`am_exclusive_quality_probe` is an explicit test DLL, excluded from normal
+builds and installer payloads. `RunQualityAbiProbe` requires an already loaded
+CoreMedia/CoreFoundation, temporarily installs its own quality hooks, constructs
+a strict ALAC filter and empty native filter tree, calls tree Apply, then
+removes its hooks and releases its objects. It rejects an already hooked simple
+factory. The probe passed inside package `1.1792.39682.0`; policy tests separately
+check highest-rate admission and downgrade rejection. This is not a streamed
+catalog/bandwidth or audible bit-perfect acceptance test.
+
+## Existing drain probe
+
 Build explicitly (the target is excluded from normal builds):
 
 ```powershell

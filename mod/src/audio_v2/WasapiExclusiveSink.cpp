@@ -813,6 +813,42 @@ void WasapiExclusiveSink::Pause() noexcept {
     StopInternal(clock_ != nullptr);
 }
 
+HRESULT WasapiExclusiveSink::DrainAndClose() noexcept {
+    stopRequested_.store(true, std::memory_order_release);
+    if (shutdownEvent_) SetEvent(shutdownEvent_);
+    if (renderThread_) {
+        WaitForSingleObject(renderThread_, INFINITE);
+        CloseHandle(renderThread_);
+        renderThread_ = nullptr;
+    }
+    // No further Prepare/Fill may run. Let the existing short device queue
+    // finish so closing for a browser/video pause cannot discard music frames.
+    HRESULT result = S_OK;
+    if (client_ && clock_ && submittedFrames_.load(std::memory_order_acquire) != 0 &&
+        state_.load(std::memory_order_acquire) != WasapiSinkState::Faulted) {
+        if (waitingForSource_.load(std::memory_order_acquire) || pausedWithBuffer_) {
+            result = client_->Start();
+            if (SUCCEEDED(result)) NoteClientStarted();
+        }
+        const auto deadline = GetTickCount64() + 500;
+        while (SUCCEEDED(result)) {
+            std::uint64_t position{};
+            result = ReadClockPosition(position);
+            if (FAILED(result) || position >= clockTarget_.load(std::memory_order_acquire)) break;
+            if (GetTickCount64() >= deadline) {
+                result = ammod::audio::kEndpointDrainTimeout;
+                break;
+            }
+            Sleep(1);
+        }
+    }
+    // Even a removed device or stalled clock must release ownership. Time is
+    // only a failure bound, never evidence that the submitted PCM was played.
+    RecordError(result);
+    Close();
+    return result;
+}
+
 void WasapiExclusiveSink::Stop() noexcept {
     StopInternal(false);
 }

@@ -29,6 +29,9 @@ jobs:
           & "$env:RUNNER_TEMP/ame-build/dist/AMExclusive-Setup.exe" --extract-test
           if ($LASTEXITCODE -ne 0) { throw "Setup extraction check failed: $LASTEXITCODE" }
 
+      - name: Run regression tests
+        run: ctest --test-dir "$env:RUNNER_TEMP/ame-build" -C Release --output-on-failure
+
       - name: Upload Setup
         uses: actions/upload-artifact@v4
         with:

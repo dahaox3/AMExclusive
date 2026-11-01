@@ -23,6 +23,7 @@ struct AudioCoreCoordinatorConfig final {
     std::uint64_t mediaGeneration{1};
     PcmMappingPolicy mappingPolicy{PcmMappingPolicy::ExactSourceInteger};
     bool verifyBitPerfect{};
+    bool followDefaultEndpointOnResume{};
 };
 
 struct AudioCoreCoordinatorStats final {
@@ -65,6 +66,7 @@ public:
     HRESULT Start() noexcept;
     void PauseEndpoint() noexcept;
     HRESULT ResumeEndpoint() noexcept;
+    bool EndpointReleased() const noexcept { return endpointReleased_; }
 
     bool ShouldSuppressNative() const noexcept;
     bool IsEnabled() const noexcept { return gate_.UiEnabled(); }
@@ -137,6 +139,10 @@ private:
     BitPerfectVerifier verifier_{};
     WasapiExclusiveSink sink_{};
     HANDLE sourceReadyEvent_{};
+    WasapiSinkConfig resumeConfig_{};
+    PcmFormat resumeFormat_{};
+    std::uint32_t resumeBufferFrames_{};
+    bool endpointReleased_{};
     std::uint64_t nextSequence_{};
     std::atomic<std::uint64_t> capturedFrames_{};
     std::atomic<std::uint64_t> droppedFrames_{};

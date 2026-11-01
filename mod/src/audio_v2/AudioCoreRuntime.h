@@ -26,6 +26,8 @@ enum class AudioCoreRuntimeEvent : std::uint8_t {
     Faulted,
     Disabled,
     Telemetry,
+    EndpointReleased,
+    EndpointWaiting,
 };
 
 struct AudioCoreRuntimeEventSnapshot;
@@ -398,6 +400,7 @@ private:
     std::uint32_t requiredPrebufferFrames_{};
     std::wstring nativeEndpoint_;
     ULONGLONG nextTelemetryTick_{};
+    ULONGLONG nextEndpointRetryTick_{};
     // Read-only classifier snapshots continue while the UI switch is Off.
     // This is deliberately separate from the Active telemetry tick so an
     // observer-only run never arms the v2 graph or endpoint.

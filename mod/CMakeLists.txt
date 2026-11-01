@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.1.0 LANGUAGES CXX RC)
+project(AMExclusive VERSION 0.2.0 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -178,3 +178,25 @@ am_add_version_info(am_exclusive_broker "am-exclusive-broker.exe" "AMExclusive A
 am_add_version_info(am_exclusive_setup "AMExclusive-Setup.exe" "AMExclusive installer" "AMExclusive 安装程序" VFT_APP)
 
 include("${CMAKE_CURRENT_LIST_DIR}/src/output_device/CMakeLists.txt" OPTIONAL)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(am_exclusive_regression_tests tests/RegressionTests.cpp)
+  target_include_directories(am_exclusive_regression_tests PRIVATE src)
+  add_test(NAME regressions COMMAND am_exclusive_regression_tests)
+  add_test(NAME installer_identity COMMAND "${POWERSHELL_EXECUTABLE}"
+    -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/InstallerIdentity.Tests.ps1")
+  # Explicit runtime probe; never injected or launched by CTest/installers.
+  add_library(am_exclusive_quality_probe SHARED EXCLUDE_FROM_ALL
+    tests/QualityAbiProbe.cpp src/LosslessQualityLock.cpp)
+  target_include_directories(am_exclusive_quality_probe PRIVATE src)
+  target_compile_definitions(am_exclusive_quality_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(am_exclusive_quality_probe PRIVATE minhook)
+  add_executable(am_exclusive_endpoint_lease_probe EXCLUDE_FROM_ALL
+    tests/EndpointLeaseProbe.cpp src/audio_v2/AudioCoreCoordinator.cpp
+    src/audio_v2/ResampledPcmSource.cpp src/audio_v2/WasapiExclusiveSink.cpp)
+  target_include_directories(am_exclusive_endpoint_lease_probe PRIVATE
+    src "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
+  target_compile_definitions(am_exclusive_endpoint_lease_probe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(am_exclusive_endpoint_lease_probe PRIVATE ole32 uuid avrt propsys)
+endif()

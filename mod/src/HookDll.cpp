@@ -1900,6 +1900,18 @@ void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntim
                                         : L"audio_core_v2_faulted", {}, snapshot.contextToken, snapshot.epoch);
         break;
     }
+    case ammod::audio_v2::AudioCoreRuntimeEvent::EndpointReleased:
+    case ammod::audio_v2::AudioCoreRuntimeEvent::EndpointWaiting:
+        Log(event == ammod::audio_v2::AudioCoreRuntimeEvent::EndpointReleased
+            ? L"exclusive endpoint released for pause; PCM queue retained"
+            : L"exclusive endpoint reacquire pending result=" + HResultText(result));
+        SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
+                       ammod::ipc::RuntimeState::WaitingForStream, true, {}, nullptr, result,
+                       ammod::ipc::CategorizeAudioError(result),
+                       event == ammod::audio_v2::AudioCoreRuntimeEvent::EndpointReleased
+                           ? L"paused_endpoint_released" : L"waiting_for_output_device",
+                       {}, snapshot.contextToken, snapshot.epoch);
+        break;
     case ammod::audio_v2::AudioCoreRuntimeEvent::Disabled:
         SendAgentEvent(ammod::ipc::MessageType::StatusChanged,
                        ammod::ipc::RuntimeState::Off, false, {}, nullptr, S_OK,
@@ -3594,7 +3606,11 @@ DWORD WINAPI PipeClientLoop(void*) {
                 }
                 lastStatusGeneration = incoming.generation;
                 AcceptBrokerEventContext(incoming);
-                const bool enabled = incoming.enabledIntent != 0;
+                // New brokers broadcast ownership to connected standby Agents.
+                // A zero PID remains compatible with older brokers, whose
+                // single-authority connection was the ownership boundary.
+                const bool enabled = incoming.enabledIntent != 0 &&
+                    (incoming.agentPid == 0 || incoming.agentPid == GetCurrentProcessId());
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
                 g_audioCoreRuntime.SetHardwareBufferMilliseconds(hardwareBufferMs);

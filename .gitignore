@@ -7,6 +7,10 @@
 /mod/tests/*
 !/mod/tests/WasapiDrainProbe.cpp
 !/mod/tests/README.md
+!/mod/tests/RegressionTests.cpp
+!/mod/tests/InstallerIdentity.Tests.ps1
+!/mod/tests/QualityAbiProbe.cpp
+!/mod/tests/EndpointLeaseProbe.cpp
 /mod/src/Controller.cpp
 /mod/src/PcmProbeDll.cpp
 /mod/src/audio_v2/FinalPcmDump.cpp

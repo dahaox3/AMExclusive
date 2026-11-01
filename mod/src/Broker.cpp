@@ -1,4 +1,5 @@
 #include "BoundedLog.h"
+#include "AgentOwnership.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
 
@@ -72,6 +73,7 @@ struct Client {
     HANDLE pipe{};
     Role role{Role::Unknown};
     DWORD pid{};
+    ULONGLONG created{};
 };
 
 std::mutex g_mutex;
@@ -88,6 +90,7 @@ Message g_status = [] {
 
 void Log(const std::wstring& text);
 void Broadcast(const Message& message, HANDLE source);
+void SelectAgentLocked(HANDLE pipe, DWORD pid);
 std::vector<DWORD> FindProcesses(const wchar_t* executableName);
 
 bool UseChineseUi() noexcept {
@@ -723,6 +726,18 @@ void RemoveClient(HANDLE pipe) {
         std::erase_if(g_clients, [pipe](const Client& client) { return client.pipe == pipe; });
         if (removedRole == Role::Agent && pipe == g_authoritativeAgentPipe) {
             g_authoritativeAgentPipe = INVALID_HANDLE_VALUE;
+            g_status.agentPid = 0;
+            const Client* successor{};
+            for (const auto& client : g_clients) {
+                if (client.role != Role::Agent) continue;
+                if (!successor || PreferAgent({client.pid, client.created},
+                                              {successor->pid, successor->created})) successor = &client;
+            }
+            if (successor) {
+                SelectAgentLocked(successor->pipe, successor->pid);
+                status = g_status;
+                publishStatus = true;
+            } else
             {
                 CoCreateGuid(&g_status.requestId);
                 const bool failedWhileRunning = g_status.enabledIntent &&
@@ -754,7 +769,8 @@ std::vector<std::pair<HANDLE, DWORD>> SnapshotTargets(HANDLE source) {
     std::vector<std::pair<HANDLE, DWORD>> targets;
     std::lock_guard lock(g_mutex);
     auto append = [&](const Client& client) {
-        if (client.role == Role::Agent && client.pipe != g_authoritativeAgentPipe) return;
+        // Standby Agents stay connected and learn the elected owner's PID.
+        // They disable their local runtime without entering a reconnect loop.
         HANDLE duplicate{};
         if (DuplicateHandle(GetCurrentProcess(), client.pipe, GetCurrentProcess(), &duplicate,
                             0, FALSE, DUPLICATE_SAME_ACCESS)) {
@@ -961,19 +977,20 @@ void HandleMessage(const Message& incoming, HANDLE source) {
 
 // Caller holds g_mutex. A connection is an authority boundary even when its
 // process ID is unchanged; status broadcasts can arrive out of order.
-std::vector<HANDLE> BeginAgentConnectionLocked(HANDLE pipe) {
-    std::vector<HANDLE> superseded;
-    for (const auto& client : g_clients)
-        if (client.role == Role::Agent && client.pipe != pipe) superseded.push_back(client.pipe);
+void SelectAgentLocked(HANDLE pipe, DWORD pid) {
     g_authoritativeAgentPipe = pipe;
+    g_status.agentPid = pid;
     CoCreateGuid(&g_status.requestId);
     ++g_status.generation;
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     g_status.error = ErrorCategory::None;
     g_status.hresult = S_OK;
+    g_status.endpointId[0] = 0;
+    g_status.endpointName[0] = 0;
+    g_status.format[0] = 0;
+    g_status.detail[0] = 0;
     g_status.senderPid = GetCurrentProcessId();
     GetSystemTimeAsFileTime(&g_status.timestampUtc);
-    return superseded;
 }
 
 void ClientThread(HANDLE pipe) {
@@ -1008,17 +1025,37 @@ void ClientThread(HANDLE pipe) {
     }
     Message initialStatus{};
     bool publishAgentBoundary = false;
-    std::vector<HANDLE> supersededAgents;
+    ULONGLONG created{};
+    if (hello.role == Role::Agent) {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, hello.senderPid);
+        if (process) {
+            created = ProcessCreationTime(process);
+            CloseHandle(process);
+        }
+        if (!created) {
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            return;
+        }
+    }
     {
         std::lock_guard lock(g_mutex);
         if (hello.role == Role::Agent) {
-            supersededAgents = BeginAgentConnectionLocked(pipe);
-            publishAgentBoundary = true;
+            AgentIdentity owner{};
+            for (const auto& client : g_clients)
+                if (client.pipe == g_authoritativeAgentPipe) owner = {client.pid, client.created};
+            if (PreferAgent({hello.senderPid, created}, owner) || owner.pid == hello.senderPid) {
+                SelectAgentLocked(pipe, hello.senderPid);
+                publishAgentBoundary = true;
+                Log(L"Agent ownership selected pid=" + std::to_wstring(hello.senderPid));
+            } else {
+                Log(L"Agent connected in standby pid=" + std::to_wstring(hello.senderPid) +
+                    L" owner=" + std::to_wstring(owner.pid));
+            }
         }
-        g_clients.push_back({pipe, hello.role, hello.senderPid});
+        g_clients.push_back({pipe, hello.role, hello.senderPid, created});
         initialStatus = g_status;
     }
-    for (HANDLE retired : supersededAgents) DisconnectNamedPipe(retired);
     auto ack = NewMessage(MessageType::HelloAck, Role::Broker);
     ack.generation = initialStatus.generation;
     Log(L"write hello ack pid=" + std::to_wstring(hello.senderPid));

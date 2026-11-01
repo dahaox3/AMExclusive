@@ -4,6 +4,8 @@
 
 # AMExclusive
 
+This fork merges [lucap9056's output device selector](https://github.com/lucap9056/AMExclusive/tree/output-device-selector). Pausing drains the short committed device buffer and releases exclusive ownership; resuming reacquires the selected/default endpoint while retaining queued music. A busy device is reported and retried automatically. Agent ownership is stable across reconnects, CoreMedia quality locking supports package `1.1792.39682.0` with verified fingerprints, and installer identity checks use the persisted task XML SID instead of resolving display names. See [regression tests](mod/tests/README.md) for validation and limits.
+
 ### Make Apple Music on Windows a “Pro” Hi-Fi Player
 
 [中文](README.zh-CN.md)

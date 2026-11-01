@@ -247,6 +247,8 @@ void AudioCoreRuntime::OnTransportPlayPause(std::uint64_t revision) noexcept {
         resumeProducerPending_ = false;
         nativeStartedAfterUserPause_ = false;
         coordinator_.PauseEndpoint();
+        nextEndpointRetryTick_ = 0;
+        if (coordinator_.EndpointReleased()) Emit(AudioCoreRuntimeEvent::EndpointReleased, S_OK);
         return;
     }
 
@@ -284,6 +286,8 @@ void AudioCoreRuntime::OnTransportPlaybackState(std::uint64_t revision, bool pla
         resumePrebufferPending_ = false;
         resumeProducerPending_ = false;
         coordinator_.PauseEndpoint();
+        nextEndpointRetryTick_ = 0;
+        if (coordinator_.EndpointReleased()) Emit(AudioCoreRuntimeEvent::EndpointReleased, S_OK);
         return;
     }
     // Apple's logical state covers every playback entry point. Native graph
@@ -1513,11 +1517,18 @@ void AudioCoreRuntime::AdvanceEventEpochLocked() noexcept {
 
 bool AudioCoreRuntime::EventCurrentLocked(const AudioCoreRuntimeEventSnapshot& event) const noexcept {
     if (event.epoch != eventEpoch_) return false;
-    if (event.event == AudioCoreRuntimeEvent::Bound || event.event == AudioCoreRuntimeEvent::Active) {
+    if (event.event == AudioCoreRuntimeEvent::Bound || event.event == AudioCoreRuntimeEvent::Active ||
+        event.event == AudioCoreRuntimeEvent::EndpointReleased ||
+        event.event == AudioCoreRuntimeEvent::EndpointWaiting) {
         if (!UiEnabled() || !graphBound_ || event.converter != BoundConverter() ||
             event.mediaGeneration != boundMediaGeneration_.load(std::memory_order_acquire)) return false;
         if (event.event == AudioCoreRuntimeEvent::Active &&
-            coordinator_.Phase() != AudioCoreGatePhase::Active) return false;
+            (coordinator_.Phase() != AudioCoreGatePhase::Active ||
+             coordinator_.EndpointReleased() || userPauseIntent_)) return false;
+        if (event.event == AudioCoreRuntimeEvent::EndpointReleased &&
+            (!coordinator_.EndpointReleased() || !userPauseIntent_)) return false;
+        if (event.event == AudioCoreRuntimeEvent::EndpointWaiting &&
+            (!coordinator_.EndpointReleased() || userPauseIntent_ || !nextEndpointRetryTick_)) return false;
     }
     return event.event != AudioCoreRuntimeEvent::Disabled || !UiEnabled();
 }
@@ -1694,6 +1705,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     PcmFormat format{};
     if (!BuildFormat(snapshot, format)) return;
     AudioCoreCoordinatorConfig config{};
+    config.followDefaultEndpointOnResume = true;
     config.sink.format = format;
     config.sink.allowResampling = allowConversion;
     // A new generation after a known pause reopens the physical stream. Keep
@@ -1772,9 +1784,10 @@ void AudioCoreRuntime::ExtendSeekQuietPeriodLocked() noexcept {
 void AudioCoreRuntime::TryResumePausedSinkLocked(bool requireFreshProducer) noexcept {
     if (userPauseIntent_ || seekFence_ ||
         coordinator_.Phase() != AudioCoreGatePhase::Active ||
-        coordinator_.SinkState() != WasapiSinkState::Open) {
+        (coordinator_.SinkState() != WasapiSinkState::Open && !coordinator_.EndpointReleased())) {
         return;
     }
+    if (nextEndpointRetryTick_ && GetTickCount64() < nextEndpointRetryTick_) return;
     const auto generation = boundMediaGeneration_.load(std::memory_order_acquire);
     if (playbackStateAvailable_ && generation != 0 && generation == pausedPlaybackGeneration_ &&
         observedPlaybackItem_ != 0 && pausedPlaybackItem_ != 0 &&
@@ -1789,7 +1802,11 @@ void AudioCoreRuntime::TryResumePausedSinkLocked(bool requireFreshProducer) noex
         // actually resumes. The tap counter advances only for the bound source;
         // it needs no new callback work or timing estimate. Local eager PCM
         // may have no later callback and does not use this compressed-P0 fence.
-        resumeProducerPending_ = IsP0Converter(boundConverter_.load(std::memory_order_acquire));
+        // A released pause has an explicit Play boundary and retained PCM.
+        // Requiring a NEW decoder block can deadlock when that retained queue
+        // is already full: the producer is waiting for the sink to consume it.
+        resumeProducerPending_ = !coordinator_.EndpointReleased() &&
+            IsP0Converter(boundConverter_.load(std::memory_order_acquire));
         resumeProducerFrames_ = tap_.Stats().acceptedFrames;
     }
     const bool terminal = endOfStreamDrainPending_ || coordinator_.EndOfStreamSubmitted();
@@ -1810,9 +1827,19 @@ void AudioCoreRuntime::TryResumePausedSinkLocked(bool requireFreshProducer) noex
     resumeProducerPending_ = false;
     const HRESULT resume = coordinator_.ResumeEndpoint();
     if (FAILED(resume)) {
-        Emit(AudioCoreRuntimeEvent::Faulted, resume);
-        RetireCaptureLocked(false);
+        if (coordinator_.EndpointReleased()) {
+            // A browser/other player can still own the device. Keep the PCM,
+            // report a visible wait, and reacquire on a bounded retry cadence.
+            resumePrebufferPending_ = true;
+            nextEndpointRetryTick_ = GetTickCount64() + 1000;
+            Emit(AudioCoreRuntimeEvent::EndpointWaiting, resume);
+        } else {
+            Emit(AudioCoreRuntimeEvent::Faulted, resume);
+            RetireCaptureLocked(false);
+        }
     } else {
+        nextEndpointRetryTick_ = 0;
+        Emit(AudioCoreRuntimeEvent::Active, S_OK);
         if (nativeStartedAfterUserPause_ && playbackStateAvailable_ &&
             observedPlaybackItem_ != 0 && observedPlaybackItem_ == pausedPlaybackItem_)
             pausedPlaybackGeneration_ = 0;
@@ -2017,6 +2044,7 @@ void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
 }
 
 void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph, bool keepPendingCapture) noexcept {
+    nextEndpointRetryTick_ = 0;
     resumePrebufferPending_ = false;
     resumeProducerPending_ = false;
     resumeProducerFrames_ = 0;

@@ -673,6 +673,10 @@ void ApplyStatus(const Controls::ToggleSwitch& toggle) {
         // Surface a component failure while preserving the user's intent;
         // "Waiting for playback" would hide the required repair.
         presentation = ErrorText(status.error);
+    } else if (std::wstring_view(status.detail) == L"paused_endpoint_released") {
+        presentation = Localized(L"已暂停 · 输出设备已释放", L"Paused · Output device released");
+    } else if (std::wstring_view(status.detail) == L"waiting_for_output_device") {
+        presentation = Localized(L"等待输出设备 · 将自动重试", L"Waiting for output device · Retrying automatically");
     } else if (status.state == RuntimeState::Requested ||
                status.state == RuntimeState::WaitingForStream) {
         presentation = Localized(L"已开启 · 等待播放", L"Enabled · Waiting for playback");

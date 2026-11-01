@@ -36,6 +36,7 @@ SimpleFactory originalCreate{};
 using TreeApply = std::int32_t(__cdecl*)(void*, void*, void**, void*);
 TreeApply originalTreeApply{};
 std::uintptr_t mediaBase{};
+const ammod::apple_private::core_media_filter::Build* verifiedBuild{};
 double(__cdecl* maxSampleRate)(void*){};
 void*(__cdecl* arrayCreate)(void*, const void**, std::int64_t, const void*){};
 const void*(__cdecl* arrayValue)(const void*, std::int64_t){};
@@ -319,11 +320,11 @@ bool CollectStrict(void* filter, std::vector<void*>& strict, unsigned depth = 0)
         !TryReadWord(methods, offsets::kTreeApplySlot, treeApply)) {
         return false;
     }
-    if (simpleApply == mediaBase + offsets::kSimpleApplyRva) {
+    if (verifiedBuild && simpleApply == mediaBase + verifiedBuild->simpleApplyRva) {
         std::uintptr_t predicate{};
         if (!TryReadWord(filter, offsets::kSimplePredicate, predicate)) return false;
         if (predicate == reinterpret_cast<std::uintptr_t>(&Accept)) strict.push_back(filter);
-    } else if (treeApply == mediaBase + offsets::kTreeApplyRva) {
+    } else if (verifiedBuild && treeApply == mediaBase + verifiedBuild->treeApplyRva) {
         std::uintptr_t childrenWord{};
         std::uintptr_t fallbackWord{};
         if (!TryReadWord(filter, offsets::kTreeChildren, childrenWord) ||
@@ -447,8 +448,19 @@ bool ImageMatchesVerifiedBuild(HMODULE media) {
         return rva + prologue.size() <= imageSize &&
                std::memcmp(base + rva, prologue.data(), prologue.size()) == 0;
     };
-    const bool ok = matches(offsets::kSimpleApplyRva, offsets::kSimpleApplyPrologue) &&
-                    matches(offsets::kTreeApplyRva, offsets::kTreeApplyPrologue);
+    verifiedBuild = nullptr;
+    for (const auto& build : offsets::kBuilds) {
+        if (build.timestamp && build.timestamp != nt->FileHeader.TimeDateStamp) continue;
+        if (build.imageSize && build.imageSize != imageSize) continue;
+        if (matches(build.simpleApplyRva, offsets::kSimpleApplyPrologue) &&
+            matches(build.treeApplyRva, offsets::kTreeApplyPrologue)) {
+            verifiedBuild = &build;
+            break;
+        }
+    }
+    const bool ok = verifiedBuild != nullptr;
+    if (ok && writeLog) writeLog(L"CoreMedia quality ABI verified for package " +
+                                 std::wstring(verifiedBuild->packageVersion));
     if (!ok && writeLog) {
         wchar_t text[192]{};
         std::swprintf(text, std::size(text),
@@ -500,7 +512,7 @@ bool Install(HMODULE media, HMODULE foundation, LogFunction log) {
     if (status != MH_OK && status != MH_ERROR_ENABLED) return false;
     mediaBase = reinterpret_cast<std::uintptr_t>(media);
     auto* treeTarget = reinterpret_cast<void*>(mediaBase +
-        ammod::apple_private::core_media_filter::kTreeApplyRva);
+        verifiedBuild->treeApplyRva);
     if (!originalTreeApply && MH_CreateHook(treeTarget, reinterpret_cast<void*>(ApplyTree),
         reinterpret_cast<void**>(&originalTreeApply)) != MH_OK) return false;
     const auto treeStatus = MH_EnableHook(treeTarget);

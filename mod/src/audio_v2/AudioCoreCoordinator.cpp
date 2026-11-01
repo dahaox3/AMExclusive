@@ -74,6 +74,8 @@ void AudioCoreCoordinator::Disable() noexcept {
     if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
     sink_.Stop();
     sink_.Close();
+    endpointReleased_ = false;
+    resumeConfig_ = {};
     resampledSource_.Reset();
     source_.reset();
     if (queue_) queue_->Clear();
@@ -179,14 +181,43 @@ HRESULT AudioCoreCoordinator::Start() noexcept {
 
 void AudioCoreCoordinator::PauseEndpoint() noexcept {
     if (gate_.Phase() == AudioCoreGatePhase::Active &&
-        sink_.State() == WasapiSinkState::Running) {
-        sink_.Pause();
+        !endpointReleased_ && sink_.State() != WasapiSinkState::Closed) {
+        resumeConfig_ = config_.sink;
+        resumeFormat_ = sink_.Format();
+        resumeBufferFrames_ = sink_.BufferFrames();
+        // Re-query the selected/default route on resume: a video application
+        // may have changed the Windows endpoint while music was paused.
+        if (config_.followDefaultEndpointOnResume) resumeConfig_.endpointId.clear();
+        resumeConfig_.primeWithSilence = true;
+        (void)sink_.DrainAndClose();
+        endpointReleased_ = true;
     }
 }
 
 HRESULT AudioCoreCoordinator::ResumeEndpoint() noexcept {
     if (!source_ || gate_.Phase() != AudioCoreGatePhase::Active) return E_UNEXPECTED;
     if (sink_.State() == WasapiSinkState::Running) return S_OK;
+    if (endpointReleased_) {
+        const HRESULT open = sink_.Open(resumeConfig_);
+        if (FAILED(open)) return open;
+        const auto& expected = resumeFormat_;
+        const auto& actual = sink_.Format();
+        // Converter lookahead belongs to the existing output format. Keep it
+        // intact across pause; never silently reconfigure/drop staged samples.
+        if (actual.sampleRate != expected.sampleRate || actual.channels != expected.channels ||
+            actual.validBits != expected.validBits || actual.containerBits != expected.containerBits ||
+            actual.encoding != expected.encoding || sink_.BufferFrames() > resumeBufferFrames_) {
+            sink_.Close();
+            return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        }
+        const HRESULT start = sink_.Start(ActiveSource());
+        if (FAILED(start)) {
+            sink_.Close();
+            return start;
+        }
+        endpointReleased_ = false;
+        return S_OK;
+    }
     if (sink_.State() != WasapiSinkState::Open) return E_UNEXPECTED;
     return sink_.Start(ActiveSource());
 }

@@ -44,6 +44,23 @@ inline constexpr std::array<std::uint8_t, kPrologueBytes> kSimpleApplyPrologue{
 inline constexpr std::array<std::uint8_t, kPrologueBytes> kTreeApplyPrologue{
     0x4C, 0x89, 0x4C, 0x24, 0x20, 0x4C, 0x89, 0x44,
     0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x48};
+
+struct Build {
+    const wchar_t* packageVersion;
+    std::uintptr_t simpleApplyRva;
+    std::uintptr_t treeApplyRva;
+    std::uint32_t timestamp;
+    std::uint32_t imageSize;
+};
+// 1.1792: verified against CoreMedia SHA-256
+// 40736bc27ae049408e3a54ec40d7279df002e69282dd729c09c725be34e0ed4a.
+// Factory-created simple/tree filters expose these entries in their method
+// tables. Constructor and Apply disassembly retain the field/callback layout
+// above; both recorded prologues must still match before either is hooked.
+inline constexpr std::array<Build, 2> kBuilds{{
+    {L"1.1540.23042.0", kSimpleApplyRva, kTreeApplyRva, 0, 0},
+    {L"1.1792.39682.0", 0x007DC3A0, 0x007F4A60, 0x6AC9C301, 0x016B7000},
+}};
 } // namespace core_media_filter
 
 namespace agent_stack {
