@@ -55,6 +55,7 @@ LogFunction writeLog{};
 std::mutex installMutex;
 bool installed{};
 std::atomic<bool> enabled{};
+std::atomic<std::uint32_t> sourceSampleRateLimit{kDefaultSourceSampleRate};
 std::atomic<std::uint64_t> policyGeneration{1};
 std::atomic<bool> hasStrictFilters{};
 thread_local bool creatingStrictFilter{};
@@ -65,6 +66,7 @@ struct EvaluationState {
     volatile LONG sawLossless{};
     volatile LONG bestRate{};
     volatile LONG enabled{};
+    LONG ceiling{};
     volatile LONG64 generation{};
 };
 
@@ -123,10 +125,11 @@ EvaluationState& CurrentEvaluation(State& state) noexcept {
 }
 
 void ResetEvaluation(EvaluationState& evaluation, bool isEnabled,
-                     std::uint64_t generation) noexcept {
+                     std::uint64_t generation, std::uint32_t ceiling) noexcept {
     InterlockedExchange(&evaluation.sawLossless, 0);
     InterlockedExchange(&evaluation.bestRate, 0);
     InterlockedExchange(&evaluation.enabled, isEnabled ? 1L : 0L);
+    InterlockedExchange(&evaluation.ceiling, static_cast<LONG>(ceiling));
     InterlockedExchange64(&evaluation.generation, static_cast<LONG64>(generation));
 }
 
@@ -148,6 +151,9 @@ void __cdecl Reset(void* context) {
         InterlockedExchange(&evaluation.bestRate, 0);
         InterlockedExchange64(&evaluation.generation,
                               static_cast<LONG64>(currentGeneration));
+        InterlockedExchange(&evaluation.ceiling, static_cast<LONG>(
+            ProfileCeiling(true, true, true, static_cast<std::uint16_t>(state.tier),
+                           sourceSampleRateLimit.load(std::memory_order_acquire))));
     }
     InterlockedExchange(&evaluation.enabled,
                         enabled.load(std::memory_order_acquire) ? 1L : 0L);
@@ -161,8 +167,8 @@ void __cdecl Observe(void* alternate, void* context, void* filter) {
     const bool allowed = state.nativeAccept(alternate, NativeContext(context), filter) != 0;
     if (!allowed) return;
     InterlockedExchange(&evaluation.sawLossless, 1);
-    if (state.tier != 20) return;
-    Selection candidate{192000, 0};
+    const auto ceiling = static_cast<std::uint32_t>(InterlockedCompareExchange(&evaluation.ceiling, 0, 0));
+    Selection candidate{ceiling, 0};
     candidate.Observe(true, maxSampleRate(alternate));
     LONG previous = InterlockedCompareExchange(&evaluation.bestRate, 0, 0);
     while (candidate.bestRate > static_cast<std::uint32_t>(previous)) {
@@ -173,7 +179,8 @@ void __cdecl Observe(void* alternate, void* context, void* filter) {
             writeLog(L"Strict ALAC quality filter=" +
                 std::to_wstring(reinterpret_cast<std::uintptr_t>(filter)) +
                 L" highestAvailableRate=" + std::to_wstring(candidate.bestRate) +
-                L" ceiling=192000; bandwidth downgrade forbidden");
+                L" ceiling=" + std::to_wstring(ceiling) +
+                L"; highest Apple lossless source within limit; bandwidth downgrade forbidden");
         }
         break;
     }
@@ -191,8 +198,7 @@ unsigned char __cdecl Accept(void* alternate, void* context, void* filter) {
     // playable instead of producing an empty successful candidate set forever.
     if (!sawLossless) return 1;
     if (!allowed) return 0;
-    if (state.tier == 15) return 1;
-    const Selection selection{192000, static_cast<std::uint32_t>(
+    const Selection selection{static_cast<std::uint32_t>(InterlockedCompareExchange(&evaluation.ceiling, 0, 0)), static_cast<std::uint32_t>(
         InterlockedCompareExchange(&evaluation.bestRate, 0, 0))};
     return static_cast<unsigned char>(selection.Accept(true, maxSampleRate(alternate)));
 }
@@ -368,6 +374,7 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
         // separate State::directEvaluation slot.
         const bool evaluationEnabled = enabled.load(std::memory_order_acquire);
         const auto evaluationGeneration = policyGeneration.load(std::memory_order_acquire);
+        const auto evaluationSourceLimit = sourceSampleRateLimit.load(std::memory_order_acquire);
         TreeEvaluationFrame frame;
         frame.entries.reserve(strict.size());
         for (const auto& view : views.values) {
@@ -378,7 +385,9 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
             if (!alreadyPresent) {
                 frame.entries.push_back({state, {}});
                 ResetEvaluation(frame.entries.back().evaluation,
-                                evaluationEnabled, evaluationGeneration);
+                                evaluationEnabled, evaluationGeneration,
+                                ProfileCeiling(true, true, true, static_cast<std::uint16_t>(state->tier),
+                                               evaluationSourceLimit));
             }
         }
         TreeEvaluationScope evaluationScope(frame);
@@ -396,6 +405,9 @@ std::int32_t __cdecl ApplyTree(void* tree, void* input, void** output, void* inf
             auto& evaluation = CurrentEvaluation(state);
             if (InterlockedCompareExchange(&evaluation.sawLossless, 0, 0) == 0 && writeLog) {
                 writeLog(L"Strict ALAC filter found no lossless candidate in current evaluation; preserving AAC-only native selection");
+            } else if (InterlockedCompareExchange(&evaluation.bestRate, 0, 0) == 0 && writeLog) {
+                writeLog(L"No Apple lossless source within configured sample-rate limit=" +
+                         std::to_wstring(evaluationSourceLimit));
             }
         }
         const auto result = originalTreeApply(tree, input, output, info);
@@ -526,6 +538,16 @@ void SetEnabled(bool value) noexcept {
     if (previous != value) {
         policyGeneration.fetch_add(1, std::memory_order_acq_rel);
     }
+}
+
+void SetMaximumSourceSampleRate(std::uint32_t rate) noexcept {
+    rate = NormalizeSourceSampleRateLimit(rate);
+    if (sourceSampleRateLimit.exchange(rate, std::memory_order_acq_rel) != rate)
+        policyGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
+
+std::uint32_t MaximumSourceSampleRate() noexcept {
+    return sourceSampleRateLimit.load(std::memory_order_acquire);
 }
 
 std::int32_t CreateStrictLosslessFilter(SubtypeFactory factory, void* allocator,

@@ -1,5 +1,6 @@
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
+#include "LosslessQualityPolicy.h"
 #include "output_device/OutputDeviceLog.h"
 #include "output_device/SelectedEndpoint.h"
 
@@ -52,6 +53,10 @@ std::mutex g_statusMutex;
 Message g_status{};
 bool g_haveStatus{};
 std::atomic<int> g_pendingIntent{-1};
+// Publish the desired rate and its confirmation serial atomically, so a stale
+// 96 -> 48 -> 96 acknowledgement cannot erase the most recent click.
+std::atomic<std::uint64_t> g_sourceRateRequest{};
+std::atomic<std::uint32_t> g_sourceRateSerial{static_cast<std::uint32_t>(GetTickCount64())};
 
 std::mutex g_attachedButtonsMutex;
 std::unordered_map<std::uintptr_t, weak_ref<Controls::Button>> g_attachedButtons;
@@ -242,6 +247,31 @@ void RebuildOutputDeviceMenu(const Controls::MenuFlyout& flyout) {
         items.Append(MakeOutputDeviceItem(Localized(L"[独占] ", L"[Exclusive] ") + endpoint.name,
                                           endpoint.id, true, selected, currentlyExclusive, enabled));
     }
+    items.Append(Controls::MenuFlyoutSeparator());
+    Controls::MenuFlyoutItem heading;
+    heading.Text(Localized(L"Apple 无损音源上限（重新打开歌曲生效）",
+                           L"Apple lossless source limit (reopen song to apply)"));
+    heading.IsEnabled(false);
+    items.Append(heading);
+    const auto requested = g_sourceRateRequest.load();
+    const auto limit = requested ? static_cast<std::uint32_t>(requested)
+        : ammod::quality::NormalizeSourceSampleRateLimit(status.maxSourceSampleRate);
+    for (const auto rate : {48000u, 96000u, 192000u}) {
+        Controls::RadioMenuFlyoutItem item;
+        item.Text(hstring(std::to_wstring(rate / 1000u) + L" kHz"));
+        item.GroupName(L"AMExclusiveSourceSampleRate");
+        item.IsChecked(limit == rate);
+        item.IsEnabled(brokerAvailable && status.minor >= 3);
+        Controls::ToolTipService::SetToolTip(item, box_value(Localized(
+            L"自动选择上限内最高的 Apple 无损版本，不进行本机重采样。",
+            L"Select the highest Apple lossless version within this limit, without local resampling.")));
+        item.Click([rate](auto&&, auto&&) {
+            auto serial = static_cast<std::uint16_t>(g_sourceRateSerial.fetch_add(1) + 1);
+            if (serial == 0) serial = static_cast<std::uint16_t>(g_sourceRateSerial.fetch_add(1) + 1);
+            g_sourceRateRequest.store((std::uint64_t{serial} << 32) | rate);
+        });
+        items.Append(item);
+    }
 }
 
 Controls::Button CreateOutputDeviceButton(const Xaml::FrameworkElement& volume) {
@@ -359,6 +389,11 @@ void PublishStatus(const Message& incoming, std::uint64_t& lastGeneration) {
     if (incoming.type != MessageType::StatusChanged || incoming.role != Role::Broker) return;
     if (incoming.generation < lastGeneration) return;
     lastGeneration = incoming.generation;
+    auto requested = g_sourceRateRequest.load();
+    if (requested && incoming.uiPid == GetCurrentProcessId() &&
+        incoming.maxSourceSampleRate == static_cast<std::uint32_t>(requested) &&
+        incoming.sourceRateRequestSerial == static_cast<std::uint16_t>(requested >> 32))
+        g_sourceRateRequest.compare_exchange_strong(requested, 0);
     std::lock_guard lock(g_statusMutex);
     g_status = incoming;
     g_haveStatus = true;
@@ -390,8 +425,18 @@ DWORD WINAPI BrokerThread(void*) {
         }
         Log(L"controller connected to broker");
         std::uint64_t lastGeneration = 0;
+        ULONGLONG nextSourceLimitSend{};
         Message incoming{};
         for (;;) {
+            const auto sourceLimit = g_sourceRateRequest.load();
+            if (sourceLimit && GetTickCount64() >= nextSourceLimitSend) {
+                auto request = ammod::ipc::NewMessage(MessageType::SetSourceSampleRateLimit, Role::Controller);
+                request.uiPid = GetCurrentProcessId();
+                request.maxSourceSampleRate = static_cast<std::uint32_t>(sourceLimit);
+                request.sourceRateRequestSerial = static_cast<std::uint16_t>(sourceLimit >> 32);
+                if (!ammod::ipc::WriteMessage(pipe, request)) break;
+                nextSourceLimitSend = GetTickCount64() + 1000;
+            }
             if (const int pending = g_pendingIntent.exchange(-1); pending >= 0) {
                 auto request = ammod::ipc::NewMessage(MessageType::SetEnabled, Role::Controller);
                 request.uiPid = GetCurrentProcessId();

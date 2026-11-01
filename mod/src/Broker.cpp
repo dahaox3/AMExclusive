@@ -1,5 +1,6 @@
 #include "BoundedLog.h"
 #include "AgentOwnership.h"
+#include "LosslessQualityPolicy.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
 
@@ -65,6 +66,21 @@ bool WriteAllowResampling(bool enabled) {
     }
     (void)WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
     return ReadAllowResampling() == enabled;
+}
+
+std::uint32_t ReadSourceSampleRateLimit() {
+    return ammod::quality::NormalizeSourceSampleRateLimit(GetPrivateProfileIntW(
+        L"mod", L"max_source_sample_rate", ammod::quality::kDefaultSourceSampleRate,
+        BrokerIniPath().c_str()));
+}
+
+bool WriteSourceSampleRateLimit(std::uint32_t rate) {
+    if (!ammod::quality::IsSourceSampleRateLimit(rate)) return false;
+    const auto path = BrokerIniPath();
+    const auto text = std::to_wstring(rate);
+    if (!WritePrivateProfileStringW(L"mod", L"max_source_sample_rate", text.c_str(), path.c_str())) return false;
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());
+    return ReadSourceSampleRateLimit() == rate;
 }
 
 using namespace ammod::ipc;
@@ -910,12 +926,28 @@ void HandleMessage(const Message& incoming, HANDLE source) {
                         std::to_wstring(GetLastError()));
                 }
             }
+        } else if (incoming.type == MessageType::SetSourceSampleRateLimit && incoming.minor >= 3 &&
+                   (incoming.role == Role::Ui || incoming.role == Role::Controller)) {
+            if (WriteSourceSampleRateLimit(incoming.maxSourceSampleRate)) {
+                ++g_status.generation;
+                g_status.maxSourceSampleRate = incoming.maxSourceSampleRate;
+                g_status.sourceRateRequestSerial = incoming.sourceRateRequestSerial;
+                g_status.uiPid = incoming.senderPid;
+                Log(L"Apple lossless source sample-rate limit persisted rate=" +
+                    std::to_wstring(g_status.maxSourceSampleRate));
+            }
         } else if (incoming.type == MessageType::StatusChanged && incoming.role == Role::Agent) {
             const auto generation = std::max(g_status.generation + 1, incoming.generation);
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
             const auto persistedAllowResampling = g_status.allowResampling;
+            const auto sourceRateLimit = g_status.maxSourceSampleRate;
+            const auto sourceRateSerial = g_status.sourceRateRequestSerial;
+            const auto sourceRateUiPid = g_status.uiPid;
             g_status = incoming;
+            g_status.maxSourceSampleRate = sourceRateLimit;
+            g_status.sourceRateRequestSerial = sourceRateSerial;
+            g_status.uiPid = sourceRateUiPid;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
@@ -936,7 +968,13 @@ void HandleMessage(const Message& incoming, HANDLE source) {
             const auto persistedIntent = g_status.enabledIntent;
             const auto persistedHardwareBufferMs = g_status.hardwareBufferMs;
             const auto persistedAllowResampling = g_status.allowResampling;
+            const auto sourceRateLimit = g_status.maxSourceSampleRate;
+            const auto sourceRateSerial = g_status.sourceRateRequestSerial;
+            const auto sourceRateUiPid = g_status.uiPid;
             g_status = incoming;
+            g_status.maxSourceSampleRate = sourceRateLimit;
+            g_status.sourceRateRequestSerial = sourceRateSerial;
+            g_status.uiPid = sourceRateUiPid;
             g_status.type = MessageType::StatusChanged;
             g_status.role = Role::Broker;
             g_status.generation = generation;
@@ -1016,7 +1054,7 @@ void ClientThread(HANDLE pipe) {
         CloseHandle(pipe);
         return;
     }
-    if (hello.role == Role::Agent && hello.minor < 2) {
+    if (hello.role == Role::Agent && hello.minor < 3) {
         ReportComponentFailure(ErrorCategory::ProtocolVersionMismatch,
                                HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH), true);
         DisconnectNamedPipe(pipe);
@@ -1103,6 +1141,7 @@ int wmain() {
     g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
     g_status.hardwareBufferMs = ReadHardwareBufferMs();
     g_status.allowResampling = ReadAllowResampling() ? 1 : 0;
+    g_status.maxSourceSampleRate = ReadSourceSampleRateLimit();
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     // output-device-selector: exclusive intent must not survive a broker restart; kept as an override so the upstream lines above stay untouched.
     g_status.enabledIntent = 0;

@@ -5,10 +5,19 @@
 
 namespace ammod::quality {
 
+inline constexpr std::uint32_t kDefaultSourceSampleRate = 96000;
+constexpr bool IsSourceSampleRateLimit(std::uint32_t rate) noexcept {
+    return rate == 48000 || rate == 96000 || rate == 192000;
+}
+constexpr std::uint32_t NormalizeSourceSampleRateLimit(std::uint32_t rate) noexcept {
+    return IsSourceSampleRateLimit(rate) ? rate : kDefaultSourceSampleRate;
+}
+
 constexpr std::uint32_t ProfileCeiling(bool qualityLockEnabled, bool known, bool lossless,
-                                        std::uint16_t tier) noexcept {
+                                        std::uint16_t tier,
+                                        std::uint32_t sourceLimit = kDefaultSourceSampleRate) noexcept {
     if (!qualityLockEnabled || !known || !lossless) return 0;
-    return tier == 20 ? 192000u : tier == 15 ? 48000u : 0u;
+    return tier == 20 ? NormalizeSourceSampleRateLimit(sourceLimit) : tier == 15 ? 48000u : 0u;
 }
 
 // Owned by one item/filter, never a process-global "latest decoder" value.

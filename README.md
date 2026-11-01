@@ -4,6 +4,8 @@
 
 # AMExclusive
 
+**0.3.0 — Apple lossless source sample-rate limit.** The output-device flyout now offers 48 / 96 / 192 kHz source limits, defaulting to 96 kHz. Keep Apple's native setting on Hi-Res Lossless. On reopening a song, select the highest existing Apple ALAC/QLAC version within the limit: 96+48 selects 96; 176.4/192+48 selects 48; 88.2 is preferred over 48 when available. This selects a source before decoding and does not resample audio locally. The setting persists across upgrades; it does not restart the current song. AAC-only titles retain native behavior; over-limit lossless sources are rejected when no compliant lossless version exists. See [Chinese instructions](README.zh-CN.md) and [validation](mod/tests/README.md).
+
 This fork merges [lucap9056's output device selector](https://github.com/lucap9056/AMExclusive/tree/output-device-selector). Pausing drains the short committed device buffer and releases exclusive ownership; resuming reacquires the selected/default endpoint while retaining queued music. A busy device is reported and retried automatically. Agent ownership is stable across reconnects, CoreMedia quality locking supports package `1.1792.39682.0` with verified fingerprints, and installer identity checks use the persisted task XML SID instead of resolving display names. See [regression tests](mod/tests/README.md) for validation and limits.
 
 ### Make Apple Music on Windows a “Pro” Hi-Fi Player

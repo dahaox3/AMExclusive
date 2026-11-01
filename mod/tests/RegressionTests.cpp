@@ -31,6 +31,27 @@ int main() {
     Require(!item.Accept(true,std::numeric_limits<double>::quiet_NaN()), "invalid rate rejected");
     Selection next{192000,0}; next.Observe(true,44100);
     Require(next.Accept(true,44100), "next item has an independent quality ceiling");
+    Require(ProfileCeiling(true,true,true,20)==96000 &&
+            ProfileCeiling(true,true,true,15,192000)==48000,
+            "default 96 kHz source limit and native 48 kHz tier");
+    Require(NormalizeSourceSampleRateLimit(0)==96000 &&
+            !IsSourceSampleRateLimit(12345), "invalid configuration uses safe default");
+    Selection optical{96000,0};
+    for (double rate : {48000.,96000.,192000.}) optical.Observe(true,rate);
+    Require(optical.Accept(true,96000) && !optical.Accept(true,48000) &&
+            !optical.Accept(true,192000), "96 kHz is retained when available");
+    Selection appleFallback{96000,0};
+    appleFallback.Observe(true,176400); appleFallback.Observe(true,48000);
+    Require(appleFallback.Accept(true,48000) && !appleFallback.Accept(true,176400),
+            "select existing Apple 48 kHz source below 176.4 kHz version");
+    Selection optical88{96000,0};
+    for (double rate : {48000.,88200.,176400.}) optical88.Observe(true,rate);
+    Require(optical88.Accept(true,88200), "88.2 kHz is preferred to 48 kHz");
+    Selection noEligible{96000,0}; noEligible.Observe(true,192000);
+    Require(!noEligible.Accept(true,192000), "no over-limit fallback when Apple has no compliant source");
+    Selection explicit192{ProfileCeiling(true,true,true,20,192000),0};
+    explicit192.Observe(true,96000); explicit192.Observe(true,192000);
+    Require(explicit192.Accept(true,192000), "192 kHz remains available when explicitly configured");
     using namespace ammod::audio_v2;
     AudioCoreGate gate;
     gate.SetUiEnabled(true); const auto token=gate.BeginCapture();

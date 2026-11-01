@@ -1305,10 +1305,10 @@ void __cdecl HookAVCFSetPreferredMaximumSampleRate(void* playerItem, double samp
     RefreshConfiguredAudioQuality();
     const auto ceiling = ammod::quality::ProfileCeiling(true,
         g_configuredQualityKnown.load(), g_configuredLosslessEnabled.load(),
-        g_configuredStreamQuality.load());
-    // Only highest-tier locking is changed here; ordinary lossless/AAC retain
-    // Apple's existing selection policy. This ceiling alone is not the lock.
-    const double effectiveRate = ceiling == 192000 ? 192000.0 : sampleRate;
+        g_configuredStreamQuality.load(), ammod::quality::MaximumSourceSampleRate());
+    // Keep Apple's preference and the strict source selector on the same
+    // configured ceiling. AAC-only playback retains Apple's native policy.
+    const double effectiveRate = ceiling != 0 ? static_cast<double>(ceiling) : sampleRate;
     Log(L"AVCFPlayerItemSetPreferredMaximumAudioSampleRate playerItem=" +
         std::to_wstring(reinterpret_cast<std::uintptr_t>(playerItem)) +
         L" requestedRate=" + std::to_wstring(sampleRate) +
@@ -3593,8 +3593,8 @@ DWORD WINAPI PipeClientLoop(void*) {
                 if (GetLastError() == ERROR_TIMEOUT) continue;
                 break;
             }
-            if (incoming.type == MessageType::HelloAck && incoming.minor < 2) {
-                Log(L"broker lacks scoped audio-event support; connection retired");
+            if (incoming.type == MessageType::HelloAck && incoming.minor < 3) {
+                Log(L"broker lacks source sample-rate limit support; connection retired");
                 break;
             }
             if (incoming.type == MessageType::StatusChanged) {
@@ -3606,6 +3606,7 @@ DWORD WINAPI PipeClientLoop(void*) {
                 }
                 lastStatusGeneration = incoming.generation;
                 AcceptBrokerEventContext(incoming);
+                ammod::quality::SetMaximumSourceSampleRate(incoming.maxSourceSampleRate);
                 // New brokers broadcast ownership to connected standby Agents.
                 // A zero PID remains compatible with older brokers, whose
                 // single-authority connection was the ownership boundary.
@@ -3686,6 +3687,8 @@ DWORD WINAPI InitializeHooks(void*) {
     GetModuleFileNameW(g_module, modulePath, static_cast<DWORD>(std::size(modulePath)));
     const auto directory = std::filesystem::path(modulePath).parent_path();
     g_iniPath = directory / L"am-exclusive.ini";
+    ammod::quality::SetMaximumSourceSampleRate(GetPrivateProfileIntW(
+        L"mod", L"max_source_sample_rate", ammod::quality::kDefaultSourceSampleRate, g_iniPath.c_str()));
     g_logPath = directory / L"am-exclusive.log";
     LogEnvironmentSnapshot();
     g_nativeTraceEnabled.store(ReadBool(L"native_trace", false), std::memory_order_release);

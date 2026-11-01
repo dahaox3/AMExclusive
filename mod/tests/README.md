@@ -2,6 +2,17 @@
 
 ## Fork regression checks
 
+0.3.0 also checks the default 96 kHz ceiling, 96/88.2 preservation, fallback
+to Apple's 48 kHz candidate, no over-limit admission, and explicit 192 kHz.
+`am_exclusive_source_selection_probe` is an explicit test DLL excluded from
+normal builds and installers. It includes the production quality-selector
+translation unit and calls its Create/ApplyTree callbacks directly on temporary
+native filters and captured Apple candidate arrays, without installing hooks
+or changing the real player selection. On package 1.1792 it returned [96000]
+for [96000,48000] at a 96000 cap, [48000] for [176400,48000], and [176400]
+for that same second list at a 192000 cap. It does not test an actual download
+or audible playback of the selected source.
+
 `ctest --test-dir <build-directory> -C Release --output-on-failure` runs the
 Agent election/quality/callback tests and the PowerShell installer SID tests.
 They do not acquire audio endpoints or modify scheduled tasks.

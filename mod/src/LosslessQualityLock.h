@@ -14,6 +14,8 @@ bool Install(HMODULE coreMedia, HMODULE coreFoundation, LogFunction log);
 // than the verified one. Install never succeeds afterwards in this process.
 bool Unavailable() noexcept;
 void SetEnabled(bool enabled) noexcept;
+void SetMaximumSourceSampleRate(std::uint32_t rate) noexcept;
+std::uint32_t MaximumSourceSampleRate() noexcept;
 std::int32_t CreateStrictLosslessFilter(SubtypeFactory factory, void* allocator,
                                         void* allowedSubtypes, std::uint16_t tier,
                                         void** output);

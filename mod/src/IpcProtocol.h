@@ -12,7 +12,7 @@ namespace ammod::ipc {
 
 inline constexpr std::uint32_t kMagic = 0x50494D41; // "AMIP" little-endian
 inline constexpr std::uint16_t kProtocolMajor = 2;
-inline constexpr std::uint16_t kProtocolMinor = 2;
+inline constexpr std::uint16_t kProtocolMinor = 3;
 inline constexpr std::size_t kEndpointIdChars = 256;
 inline constexpr std::size_t kEndpointNameChars = 128;
 inline constexpr std::size_t kFormatChars = 160;
@@ -43,6 +43,7 @@ enum class MessageType : std::uint16_t {
     TransportIntent = 9,
     SetHardwareBuffer = 10,
     SetAllowResampling = 11,
+    SetSourceSampleRateLimit = 12,
 };
 
 enum class RuntimeState : std::uint16_t {
@@ -110,7 +111,10 @@ struct Message {
     std::uint8_t enabledIntent{};
     // Protocol 2.1 uses a formerly reserved byte; 2.0 peers leave this false.
     std::uint8_t allowResampling{};
-    std::uint8_t reserved[6]{};
+    // 2.3 echoes source-setting confirmation serials, scoped by uiPid.
+    std::uint16_t sourceRateRequestSerial{};
+    // Protocol 2.3 uses the remaining four reserved bytes; wire size is unchanged.
+    std::uint32_t maxSourceSampleRate{96000};
     wchar_t endpointId[kEndpointIdChars]{};
     wchar_t endpointName[kEndpointNameChars]{};
     wchar_t format[kFormatChars]{};
