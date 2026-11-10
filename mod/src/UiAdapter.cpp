@@ -911,6 +911,8 @@ void RefreshPlaybackState(const std::shared_ptr<UiWindowContext>& context) noexc
         if (player != context->player) {
             ClearPlaybackObserver(context);
             context->player = player;
+            Log(L"Apple player observer attached ABI=" +
+                std::wstring(ApplePlayback::PlayerAbiName(ApplePlayback::DetectPlayerAbi(player))));
             context->playerChanged = player.PropertyChanged(
                 [weak](auto&&, Xaml::Data::PropertyChangedEventArgs const& args) noexcept {
                     try {
