@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.3.0 LANGUAGES CXX RC)
+project(AMExclusive VERSION 0.3.1 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -181,6 +181,14 @@ include("${CMAKE_CURRENT_LIST_DIR}/src/output_device/CMakeLists.txt" OPTIONAL)
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(am_exclusive_lifecycle_tests tests/PlaybackLifecycleTests.cpp
+    src/audio_v2/AudioCoreRuntime.cpp src/audio_v2/AudioCoreCoordinator.cpp
+    src/audio_v2/ResampledPcmSource.cpp src/audio_v2/WasapiExclusiveSink.cpp)
+  target_include_directories(am_exclusive_lifecycle_tests PRIVATE src
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/rigtorp-SPSCQueue/include")
+  target_compile_definitions(am_exclusive_lifecycle_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(am_exclusive_lifecycle_tests PRIVATE ole32 uuid avrt)
+  add_test(NAME playback_lifecycle COMMAND am_exclusive_lifecycle_tests)
   add_executable(am_exclusive_regression_tests tests/RegressionTests.cpp)
   target_include_directories(am_exclusive_regression_tests PRIVATE src)
   add_test(NAME regressions COMMAND am_exclusive_regression_tests)

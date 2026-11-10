@@ -2,6 +2,22 @@
 
 ## Fork regression checks
 
+0.3.1 adds a hardware-free playback lifecycle test linked against the production
+runtime. It checks unexpired/paused drains, bounded EOF recovery, same-decoder
+rearming, retired pointer reuse, a 96-to-48 kHz successor, and selection/play
+pause fences. Mock media transport tests check confirmed round trips, same-title
+different-artist identities, paused requests, first-item fallback and unavailable
+single-item queues. These tests acquire no audio endpoint and do not control
+the user's Apple Music session. Settings replay and actual natural transitions
+still require post-install Apple Music/device acceptance testing.
+
+The reopen helper runs only after the elected Agent applies changed settings.
+It coalesces requests, waits through user pauses and cancels an old item when
+the user changes tracks. Reopen uses a verified previous/next (or next/previous)
+round trip, starts the song from the beginning, and is best-effort when Apple
+disables queue navigation. It records confirmation/failure in
+`am-exclusive-recovery.log`; API acceptance alone is never reported as success.
+
 0.3.0 also checks the default 96 kHz ceiling, 96/88.2 preservation, fallback
 to Apple's 48 kHz candidate, no over-limit admission, and explicit 192 kHz.
 `am_exclusive_source_selection_probe` is an explicit test DLL excluded from

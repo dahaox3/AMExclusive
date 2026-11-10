@@ -205,11 +205,15 @@ std::vector<RenderEndpoint> EnumerateRenderEndpoints() {
     return endpoints;
 }
 
-void SelectOutputDevice(const std::wstring& endpointId, bool exclusive, bool currentlyExclusive) {
+void SelectOutputDevice(const std::wstring& endpointId, bool exclusive) {
     Log(L"user selected output device exclusive=" + std::to_wstring(exclusive) +
         L" endpoint=" + (endpointId.empty() ? std::wstring(L"<default>") : endpointId));
-    if (!Store().Write(endpointId)) Log(L"selected endpoint store write failed");
-    if (exclusive != currentlyExclusive) g_pendingIntent.store(exclusive ? 1 : 0);
+    if (!Store().Write(endpointId)) {
+        Log(L"selected endpoint store write failed");
+        return;
+    }
+    // Also publish same-mode device changes so the Agent applies/reopens them.
+    g_pendingIntent.store(exclusive ? 1 : 0);
 }
 
 Controls::RadioMenuFlyoutItem MakeOutputDeviceItem(const std::wstring& text, const std::wstring& endpointId,
@@ -221,8 +225,8 @@ Controls::RadioMenuFlyoutItem MakeOutputDeviceItem(const std::wstring& text, con
     item.GroupName(L"AMExclusiveOutputDevice");
     item.IsChecked(current);
     item.IsEnabled(enabled);
-    item.Click([endpointId, exclusive, current, currentlyExclusive](auto&&, auto&&) {
-        if (!current) SelectOutputDevice(endpointId, exclusive, currentlyExclusive);
+    item.Click([endpointId, exclusive, current](auto&&, auto&&) {
+        if (!current) SelectOutputDevice(endpointId, exclusive);
     });
     return item;
 }
@@ -249,8 +253,8 @@ void RebuildOutputDeviceMenu(const Controls::MenuFlyout& flyout) {
     }
     items.Append(Controls::MenuFlyoutSeparator());
     Controls::MenuFlyoutItem heading;
-    heading.Text(Localized(L"Apple 无损音源上限（重新打开歌曲生效）",
-                           L"Apple lossless source limit (reopen song to apply)"));
+    heading.Text(Localized(L"Apple 无损音源上限（播放时自动重开歌曲）",
+                           L"Apple lossless source limit (reopens while playing)"));
     heading.IsEnabled(false);
     items.Append(heading);
     const auto requested = g_sourceRateRequest.load();

@@ -120,6 +120,7 @@ struct AudioCoreRuntimeEventSnapshot final {
 // private worker thread. The only callback-thread operation is copying the
 // returned Apple float32 buffer into the preallocated SPSC queue.
 class AudioCoreRuntime final {
+    friend struct AudioCoreRuntimeRegression;
 public:
     AudioCoreRuntime() noexcept;
     ~AudioCoreRuntime();
@@ -351,6 +352,8 @@ private:
     bool graphPaused_{};
     bool graphControlPending_{};
     bool userPauseIntent_{};
+    // Selecting a row revokes the old pause, but is not itself a Play command.
+    bool selectionAwaitingStart_{};
     bool resumePrebufferPending_{};
     bool resumeProducerPending_{};
     std::uint64_t resumeProducerFrames_{};
@@ -386,6 +389,9 @@ private:
     // restart its frame cursor without waiting on the control thread.
     std::atomic<void*> streamingEofCandidateConverter_{};
     bool endOfStreamDrainPending_{};
+    std::uint64_t endOfStreamDrainRemainingMs_{};
+    std::uint64_t endOfStreamDrainLastTick_{};
+    std::uint64_t endOfStreamDrainRegistration_{};
     void* endOfStreamDrainConverter_{};
     std::atomic<std::uint64_t> directSelectionArmEpoch_{};
     std::atomic<std::uint64_t> directSelectionArmGeneration_{};

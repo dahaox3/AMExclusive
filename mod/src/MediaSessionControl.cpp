@@ -1,4 +1,5 @@
 #include "BoundedLog.h"
+#include "SettingsRestartPolicy.h"
 
 #include <windows.h>
 #include <winrt/base.h>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <chrono>
 
 using namespace winrt;
 using namespace Windows::Media::Control;
@@ -29,13 +31,7 @@ void LogRecovery(const std::string& message) {
     ammod::logging::AppendWideLine(logPath, logMutex, line, 1ull * 1024ull * 1024ull, 2);
 }
 
-struct MediaIdentity {
-    std::wstring title;
-    std::wstring artist;
-    std::wstring albumTitle;
-    std::int32_t trackNumber{};
-    std::int64_t timelineEnd100ns{};
-};
+using MediaIdentity = ammod::media::Identity;
 
 MediaIdentity ReadMediaIdentity(const GlobalSystemMediaTransportControlsSession& session) {
     const auto media = session.TryGetMediaPropertiesAsync().get();
@@ -113,9 +109,108 @@ bool RestartCurrentItem(const GlobalSystemMediaTransportControlsSession& session
     return result.returned;
 }
 
+template<class Operation>
+auto BoundedResult(Operation operation) {
+    if (operation.wait_for(std::chrono::seconds(3)) != Windows::Foundation::AsyncStatus::Completed) {
+        operation.Cancel();
+        throw hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    }
+    return operation.GetResults();
+}
+
+struct SettingsTransport {
+    GlobalSystemMediaTransportControlsSession session;
+    HANDLE cancelled{};
+    bool Cancelled() const { return WaitForSingleObject(cancelled, 0) != WAIT_TIMEOUT; }
+    MediaIdentity Read() {
+        const auto media = BoundedResult(session.TryGetMediaPropertiesAsync());
+        return {media.Title().c_str(), media.Artist().c_str(), media.AlbumTitle().c_str(),
+                media.TrackNumber(), session.GetTimelineProperties().EndTime().count()};
+    }
+    bool Playing() { return !Cancelled() && session.GetPlaybackInfo().PlaybackStatus() ==
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing; }
+    bool SeekStart() { return !Cancelled() && BoundedResult(session.TryChangePlaybackPositionAsync(
+        session.GetTimelineProperties().StartTime().count())); }
+    bool Step(bool previous) {
+        if (Cancelled()) return false;
+        const auto controls = session.GetPlaybackInfo().Controls();
+        if (previous ? !controls.IsPreviousEnabled() : !controls.IsNextEnabled()) return false;
+        return previous ? BoundedResult(session.TrySkipPreviousAsync())
+                        : BoundedResult(session.TrySkipNextAsync());
+    }
+    void Pause() { if (!Cancelled()) (void)BoundedResult(session.TryPauseAsync()); }
+    void Wait() { Sleep(50); }
+};
+
+int ApplySettingsRestart(DWORD ownerPid, const wchar_t* scope) {
+    // Scope requests to the elected Agent lifetime. Concurrent setting changes
+    // signal the existing worker instead of starting competing skip sequences.
+    const std::wstring prefix = scope;
+    winrt::handle cancelled{OpenEventW(SYNCHRONIZE, FALSE, scope)};
+    winrt::handle pending{CreateEventW(nullptr, TRUE, FALSE, (prefix + L".Pending").c_str())};
+    winrt::handle single{CreateMutexW(nullptr, FALSE, (prefix + L".Worker").c_str())};
+    winrt::handle owner{OpenProcess(SYNCHRONIZE, FALSE, ownerPid)};
+    if (!pending || !single || !owner || !cancelled) return 6;
+    SetEvent(pending.get());
+    const auto acquired = WaitForSingleObject(single.get(), 0);
+    if (acquired == WAIT_TIMEOUT) return 0;
+    if (acquired != WAIT_OBJECT_0 && acquired != WAIT_ABANDONED) return 6;
+    struct Unlock { HANDLE handle; ~Unlock() { ReleaseMutex(handle); } } unlock{single.get()};
+    const HANDLE waits[]{owner.get(), cancelled.get(), pending.get()};
+    // Stay idle on the event until this Agent exits. This also closes the race
+    // between the last request check and worker exit when a new edit arrives.
+    while (WaitForMultipleObjects(3, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 2) {
+        ResetEvent(pending.get());
+        try {
+            const auto manager = BoundedResult(GlobalSystemMediaTransportControlsSessionManager::RequestAsync());
+            GlobalSystemMediaTransportControlsSession session{nullptr};
+            for (const auto& candidate : manager.GetSessions()) {
+                if (std::wstring(candidate.SourceAppUserModelId()).find(L"AppleMusic") != std::wstring::npos) {
+                    session = candidate;
+                    break;
+                }
+            }
+            if (!session) continue;
+            SettingsTransport transport{session, cancelled.get()};
+            const auto original = transport.Read();
+            if (!original.Valid()) continue;
+            for (;;) {
+                // Debounce rapid edits and wait for user-driven resume. A new song
+                // already uses the latest settings, so never jump back to the old one.
+                bool itemChanged = false;
+                do {
+                    if (WaitForMultipleObjects(2, waits, FALSE, 500) != WAIT_TIMEOUT) return 0;
+                    if (transport.Read() != original) { itemChanged = true; break; }
+                    if (WaitForSingleObject(pending.get(), 0) == WAIT_OBJECT_0) {
+                        ResetEvent(pending.get());
+                        continue;
+                    }
+                    if (transport.Playing()) break;
+                } while (true);
+                if (itemChanged) break;
+                const bool reopened = ammod::media::Reopen(transport, original);
+                LogRecovery(std::string("settings-restart confirmed=") + (reopened ? "1" : "0"));
+                // Failure is explicit in the recovery log; never endlessly skip.
+                if (!reopened) break;
+                if (WaitForSingleObject(pending.get(), 0) != WAIT_OBJECT_0) break;
+                ResetEvent(pending.get());
+            }
+        } catch (const hresult_error& error) {
+            LogRecovery("settings-restart failed HRESULT=" + std::to_string(error.code().value));
+        } catch (...) {
+            LogRecovery("settings-restart failed unexpected exception");
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc == 4 && _wcsicmp(argv[1], L"settings-restart") == 0) {
+        init_apartment(apartment_type::multi_threaded);
+        return ApplySettingsRestart(wcstoul(argv[2], nullptr, 10), argv[3]);
+    }
     if (argc != 2 || (_wcsicmp(argv[1], L"restart-current") != 0 &&
                       _wcsicmp(argv[1], L"reject-current") != 0)) return 2;
 

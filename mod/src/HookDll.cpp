@@ -18,6 +18,7 @@
 #include "LosslessQualityLock.h"
 #include "LosslessQualityPolicy.h"
 #include "UiPlaybackState.h"
+#include "output_device/SelectedEndpoint.h"
 #include "audio_v2/AudioCoreGate.h"
 #include "audio_v2/AudioCoreRuntime.h"
 #include "audio_v2/NativeRenderGateProxy.h"
@@ -3545,6 +3546,15 @@ DWORD WINAPI PipeClientLoop(void*) {
     using namespace ammod::ipc;
     const auto name = PipeName();
     if (name.empty()) return 1;
+    ammod::output_device::SelectedEndpointStore selectedEndpoint;
+    Message appliedSettings{};
+    std::wstring appliedEndpoint;
+    bool haveAppliedSettings = false;
+    HANDLE restartCancel{};
+    std::wstring restartScope;
+    const auto cancelRestart = [&] {
+        if (restartCancel) { SetEvent(restartCancel); CloseHandle(restartCancel); restartCancel = nullptr; }
+    };
     for (;;) {
         if (!WaitNamedPipeW(name.c_str(), 2000)) {
             Sleep(1000);
@@ -3620,6 +3630,46 @@ DWORD WINAPI PipeClientLoop(void*) {
                 if (!enabled) g_nativeP0Puller.DisableForUiOff();
                 g_audioCoreGate.SetUiEnabled(enabled);
                 g_audioCoreRuntime.SetUiEnabled(enabled);
+                const auto endpoint = selectedEndpoint.Read();
+                const bool owner = incoming.agentPid == GetCurrentProcessId();
+                if (!owner) cancelRestart();
+                const bool settingsChanged = haveAppliedSettings &&
+                    appliedSettings.agentPid == incoming.agentPid &&
+                    (appliedSettings.maxSourceSampleRate != incoming.maxSourceSampleRate ||
+                     appliedSettings.hardwareBufferMs != incoming.hardwareBufferMs ||
+                     appliedSettings.allowResampling != incoming.allowResampling ||
+                     appliedSettings.enabledIntent != incoming.enabledIntent ||
+                     appliedEndpoint != endpoint);
+                appliedSettings = incoming;
+                appliedEndpoint = endpoint;
+                haveAppliedSettings = true;
+                // All settings are applied before requesting a new Apple source.
+                // Only the elected Agent may launch this; helper requests coalesce.
+                if (owner && settingsChanged) {
+                    if (!restartCancel) {
+                        GUID id{};
+                        wchar_t text[40]{};
+                        CoCreateGuid(&id);
+                        StringFromGUID2(id, text, 40);
+                        restartScope = std::wstring(L"Local\\AMExclusive.SettingsRestart.") + text;
+                        restartCancel = CreateEventW(nullptr, TRUE, FALSE, restartScope.c_str());
+                    }
+                    if (!restartCancel) continue;
+                    wchar_t modulePath[MAX_PATH]{};
+                    GetModuleFileNameW(g_module, modulePath, MAX_PATH);
+                    const auto helper = std::filesystem::path(modulePath).parent_path() /
+                        L"am_exclusive_media_control.exe";
+                    auto command = L"\"" + helper.wstring() + L"\" settings-restart " +
+                        std::to_wstring(GetCurrentProcessId()) + L" " + restartScope;
+                    STARTUPINFOW startup{sizeof(startup)};
+                    PROCESS_INFORMATION process{};
+                    if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE,
+                                       CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+                        CloseHandle(process.hThread);
+                        CloseHandle(process.hProcess);
+                        Log(L"settings applied; current-track reopen queued");
+                    } else Log(L"settings applied; reopen helper launch failed");
+                }
                 Log(L"broker status received enabled=" +
                     std::to_wstring(incoming.enabledIntent) + L" state=" +
                     std::to_wstring(static_cast<unsigned>(incoming.state)) +
@@ -3664,6 +3714,7 @@ DWORD WINAPI PipeClientLoop(void*) {
             }
         }
         RetireEventConnection();
+        cancelRestart();
         {
             std::lock_guard lock(g_pipeMutex);
             g_ipcConnected.store(false);

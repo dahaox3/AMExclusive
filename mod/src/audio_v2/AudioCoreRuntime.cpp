@@ -75,6 +75,7 @@ bool AudioCoreRuntime::Start(const AudioCoreRuntimeCallbacks& callbacks) noexcep
     nativePumpSampleRate_.store(0, std::memory_order_release);
     nativePumpBufferedFrames_.store(0, std::memory_order_release);
     userPauseIntent_ = false;
+    selectionAwaitingStart_ = false;
     resumePrebufferPending_ = false;
     resumeProducerPending_ = false;
     resumeProducerFrames_ = 0;
@@ -240,6 +241,7 @@ void AudioCoreRuntime::OnTransportPlayPause(std::uint64_t revision) noexcept {
     if (latestPlaybackStateRevision_ != 0 &&
         (revision == 0 || revision <= latestPlaybackStateRevision_)) return;
     if (revision != 0) latestPlaybackStateRevision_ = revision;
+    selectionAwaitingStart_ = false;
     if (coordinator_.Phase() == AudioCoreGatePhase::Active &&
         (coordinator_.SinkState() == WasapiSinkState::Running || resumePrebufferPending_)) {
         userPauseIntent_ = true;
@@ -275,6 +277,7 @@ void AudioCoreRuntime::OnTransportPlaybackState(std::uint64_t revision, bool pla
     playbackStateAvailable_ = true;
     observedPlaybackPlaying_ = playing;
     observedPlaybackItem_ = queueItem;
+    selectionAwaitingStart_ = false;
     if (!playing) {
         if (queueItem != 0 || !userPauseIntent_) pausedPlaybackItem_ = queueItem;
         pausedPlaybackGeneration_ = boundMediaGeneration_.load(std::memory_order_acquire);
@@ -330,11 +333,22 @@ void AudioCoreRuntime::OnTransportPlaybackState(std::uint64_t revision, bool pla
 
 void AudioCoreRuntime::OnTransportSelectionArm(std::uint64_t epoch) noexcept {
     if (!UiEnabled() || epoch == 0) return;
+    ControlScope lock(*this);
     directSelectionSkipEpoch_.store(0, std::memory_order_release);
     directSelectionArmGeneration_.store(
         boundMediaGeneration_.load(std::memory_order_acquire), std::memory_order_release);
     directSelectionArmEpoch_.store(epoch, std::memory_order_release);
     directSelectionArmDeadlineTick_.store(GetTickCount64() + 750, std::memory_order_release);
+    if (userPauseIntent_) {
+        userPauseIntent_ = false;
+        // Native Start can arrive before this UI -> Broker -> Agent message.
+        selectionAwaitingStart_ = !(nativeStartedAfterUserPause_ && nativeStarted_ && graphStarted_);
+        nativeStartedAfterUserPause_ = false;
+        resumePrebufferPending_ = false;
+        resumeProducerPending_ = false;
+        resumeProducerFrames_ = 0;
+        Wake();
+    }
 }
 
 void AudioCoreRuntime::OnTransportSkipArm(std::uint64_t epoch) noexcept {
@@ -355,6 +369,7 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
         directSelectionSkipEpoch_.store(epoch, std::memory_order_release);
     }
     ControlScope lock(*this);
+    if (directSelection) selectionAwaitingStart_ = false;
     if (transportSkip) {
         const auto armedGeneration =
             transportSkipArmGeneration_.load(std::memory_order_acquire);
@@ -647,6 +662,16 @@ bool AudioCoreRuntime::BeginEndOfStreamDrainLocked(void* converter,
     if (!coordinator_.SealEndOfStream()) return false;
     endOfStreamDrainPending_ = true;
     endOfStreamDrainConverter_ = converter;
+    ConverterRegistrationSnapshot snapshot{};
+    endOfStreamDrainRegistration_ = registry_.Snapshot(converter, snapshot)
+        ? snapshot.registrationId : 0;
+    // Allow the queued tail its actual playing time plus a scheduling margin.
+    // A fixed three seconds can truncate the production queue at high buffer settings.
+    const auto sourceRate = coordinator_.SourceFormat().sampleRate;
+    const auto rate = sourceRate ? sourceRate : 1u;
+    endOfStreamDrainRemainingMs_ = 3000u +
+        (static_cast<std::uint64_t>(coordinator_.PendingSourceFrames()) * 1000u + rate - 1) / rate;
+    endOfStreamDrainLastTick_ = GetTickCount64();
     return true;
 }
 
@@ -940,6 +965,7 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     coordinator_.SetSinkResumeBlocked(false);
     if (graphUnit_ == unit) {
         graphStarted_ = true;
+        selectionAwaitingStart_ = false;
         TryBindGraphLocked();
     } else if ((graphBound_ || pendingGraphBind_.converter) && graphUnit_ && unit) {
         // Apple starts the hardware-output parent AudioUnit (for example
@@ -949,6 +975,7 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
         // start is the graph-start edge for activation purposes.
         graphStarted_ = true;
         graphOutputUnit_ = unit;
+        selectionAwaitingStart_ = false;
     }
     if (!userPauseIntent_) TryResumePausedSinkLocked();
     Wake();
@@ -1051,6 +1078,7 @@ void AudioCoreRuntime::OnNativeClientStarted(void* client, HRESULT result) noexc
     nativeClient_.store(client, std::memory_order_release);
     nativeInitialized_ = true;
     nativeStarted_ = true;
+    selectionAwaitingStart_ = false;
     if (userPauseIntent_ || resumeProducerPending_) nativeStartedAfterUserPause_ = true;
     TryBindGraphLocked();
     if (!userPauseIntent_) TryResumePausedSinkLocked();
@@ -1782,7 +1810,7 @@ void AudioCoreRuntime::ExtendSeekQuietPeriodLocked() noexcept {
 }
 
 void AudioCoreRuntime::TryResumePausedSinkLocked(bool requireFreshProducer) noexcept {
-    if (userPauseIntent_ || seekFence_ ||
+    if (userPauseIntent_ || selectionAwaitingStart_ || seekFence_ ||
         coordinator_.Phase() != AudioCoreGatePhase::Active ||
         (coordinator_.SinkState() != WasapiSinkState::Open && !coordinator_.EndpointReleased())) {
         return;
@@ -1848,7 +1876,7 @@ void AudioCoreRuntime::TryResumePausedSinkLocked(bool requireFreshProducer) noex
 }
 
 void AudioCoreRuntime::TryActivateLocked() noexcept {
-    if (userPauseIntent_) return;
+    if (userPauseIntent_ || selectionAwaitingStart_) return;
     if (seekFence_) {
         if (seekFenceReleaseTick_ == 0 || GetTickCount64() < seekFenceReleaseTick_) return;
         seekFence_ = false;
@@ -1972,9 +2000,20 @@ void AudioCoreRuntime::TryActivateLocked() noexcept {
 }
 
 void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
-    if (!endOfStreamDrainPending_ || !coordinator_.EndOfStreamComplete()) return;
+    if (!endOfStreamDrainPending_) return;
+    const auto now = GetTickCount64();
+    const auto elapsed = now - endOfStreamDrainLastTick_;
+    endOfStreamDrainLastTick_ = now;
+    // A long user pause is not a stuck drain. Resume still owns the queued tail.
+    if (userPauseIntent_ || selectionAwaitingStart_) return;
+    const bool complete = coordinator_.EndOfStreamComplete();
+    endOfStreamDrainRemainingMs_ = elapsed >= endOfStreamDrainRemainingMs_
+        ? 0 : endOfStreamDrainRemainingMs_ - elapsed;
+    if (!complete && endOfStreamDrainRemainingMs_ != 0) return;
+    if (!complete) Emit(AudioCoreRuntimeEvent::Telemetry, HRESULT_FROM_WIN32(ERROR_TIMEOUT));
 
     const auto drainedConverter = endOfStreamDrainConverter_;
+    const auto drainedRegistration = endOfStreamDrainRegistration_;
     const auto localSuccessor = pendingLocalSuccessor_;
     endOfStreamDrainPending_ = false;
     endOfStreamDrainConverter_ = nullptr;
@@ -1998,6 +2037,23 @@ void AudioCoreRuntime::FinalizeEndOfStreamDrainLocked() noexcept {
         }
     }
     TryBindPendingGraphLocked();
+    // Apple Music 1.7 can reuse P0 across EOF without New/Dispose callbacks.
+    // Prefer a registered successor; rearm only the very same live registration.
+    // Binding captures PCM but does not acquire an endpoint until activation.
+    if (!graphBound_ && !pendingGraphBind_.converter && !graphConverter_ &&
+        drainedConverter && graphUnit_ && UiEnabled()) {
+        ConverterRegistrationSnapshot snapshot{};
+        if (registry_.Snapshot(drainedConverter, snapshot) &&
+            snapshot.registrationId == drainedRegistration &&
+            IsP0Converter(drainedConverter) && snapshot.registration.sourceBitDepth != 0) {
+            graphConverter_ = drainedConverter;
+            graphRate_ = snapshot.registration.outputFormat.sampleRate;
+            graphChannels_ = snapshot.registration.outputFormat.channels;
+            graphSourceBits_ = snapshot.registration.sourceBitDepth;
+            graphObservationId_ = snapshot.registration.observationId;
+            TryBindGraphLocked();
+        }
+    }
 }
 
 void AudioCoreRuntime::RetireCompletedCaptureLocked(void* converter) noexcept {
@@ -2080,6 +2136,7 @@ void AudioCoreRuntime::RetireCaptureLocked(bool keepGraph, bool keepPendingCaptu
         nextTelemetryTick_ = 0;
     }
     if (!keepGraph) {
+        selectionAwaitingStart_ = false;
         graphUnit_ = nullptr;
         graphConverter_ = nullptr;
         graphRate_ = 0;
