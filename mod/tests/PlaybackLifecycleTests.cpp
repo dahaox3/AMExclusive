@@ -142,6 +142,26 @@ struct AudioCoreRuntimeRegression {
         {
             AudioCoreRuntime r;
             prepare(r);
+            Pcm(r, successor, 48000);
+            bool producerAvailable = false;
+            r.callbacks_.context = &producerAvailable;
+            r.callbacks_.tryAcquireProducer = [](void* context) noexcept {
+                return *static_cast<bool*>(context);
+            };
+            r.nativeStarted_ = true;
+            r.OnTransportSelectionArm(60);
+            r.OnTransportSkip(60);
+            r.OnAudioUnitInitialized(nextUnit, successor, 48000, 2, 24, 1);
+            r.TryBindPendingGraphLocked();
+            Check(!r.graphBound_, "manual prepared-target handoff waits for producer lease");
+            producerAvailable = true;
+            r.TryBindPendingGraphLocked();
+            Check(r.BoundConverter() == successor && r.coordinator_.BufferedFrames() == 2,
+                  "worker retries manual prepared-target bind after producer releases");
+        }
+        {
+            AudioCoreRuntime r;
+            prepare(r);
             Register(r, successor, 48000); // missed Dispose must still fail the lifetime check
             Drain(r, decoder);
             r.FinalizeEndOfStreamDrainLocked();

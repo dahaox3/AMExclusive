@@ -1803,6 +1803,10 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (pendingCaptureOwner_ && callbacks_.tryAcquireProducer && !pendingProducerLeaseHeld_) {
         // A native Fill/Dispose may already own the producer. The worker takes
         // a nonblocking lease before publishing the new queue and moving PCM.
+        // Explicitly selecting an already prefetched graph can reach this
+        // path without an EOF request. Preserve an exact worker retry then too.
+        pendingGraphBind_ = {graphUnit_, graphConverter_, snapshot.registration.observationId,
+                             snapshot.registrationId};
         Wake();
         return;
     }
