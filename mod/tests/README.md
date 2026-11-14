@@ -2,6 +2,16 @@
 
 ## Fork regression checks
 
+0.3.3 reproduces a successor AudioUnit initialization prematurely retiring the
+current decoder, then verifies the production-runtime protection. Coverage
+includes early child/parent Starts, same-unit reuse, 96-to-48 kHz handoff,
+bounded prefetch backpressure without blocking current PCM, complete staged
+PCM promotion after old-unit teardown, canceled/reused registrations, late
+source precision, both Next event orderings, manual selection of a different
+song, explicit pause/resume and seek cancellation. These tests never start a
+runtime worker or acquire an audio device; actual Apple Music/optical playback
+is still a post-install acceptance check.
+
 0.3.1 adds a hardware-free playback lifecycle test linked against the production
 runtime. It checks unexpired/paused drains, bounded EOF recovery, same-decoder
 rearming, retired pointer reuse, a 96-to-48 kHz successor, and selection/play

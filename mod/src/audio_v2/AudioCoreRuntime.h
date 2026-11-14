@@ -286,6 +286,7 @@ private:
         std::unique_lock<std::mutex> lock_;
     };
     void TryBindGraphLocked() noexcept;
+    bool DeferGraphReplacementLocked() const noexcept;
     void TryActivateLocked() noexcept;
     void TryResumePausedSinkLocked(bool requireFreshProducer = false) noexcept;
     void ExtendSeekQuietPeriodLocked() noexcept;
@@ -368,14 +369,21 @@ private:
     bool nativeInitialized_{};
     bool nativeStarted_{};
     bool graphBound_{};
-    // Earned only when a distinct, observed successor is blocked by an old
-    // producer/endpoint drain. Consumed once after natural retirement; ordinary
+    // Earned only when a distinct, observed successor is blocked by a playing
+    // graph or its producer/endpoint drain. Consumed after retirement; ordinary
     // cancellation must never turn an unbound old graph into a retry request.
     struct PendingGraphBind final {
         void* unit{};
         void* converter{};
         std::uint64_t observationId{};
         std::uint64_t registrationId{};
+        // An early AudioUnit init must not overwrite the current graph's
+        // identity. Adopt this snapshot only after that graph has retired.
+        bool preservesCurrentGraph{};
+        bool started{};
+        std::uint32_t sampleRate{}, channels{}, sourceBitDepth{};
+        bool awaitingSelectionStart{};
+        void* outputUnit{};
     } pendingGraphBind_{};
     // Streaming native Stop is not decoder EOF. Hold the current generation
     // across AudioUnit Stop/Uninitialize while HookDll synchronously flushes

@@ -418,7 +418,16 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
     }
     // Previous/Next retains its explicit cancellation contract.
     AdvanceEventEpochLocked();
-    RetireCaptureLocked(true);
+    const auto prepared = pendingGraphBind_;
+    RetireCaptureLocked(true, prepared.preservesCurrentGraph);
+    if (prepared.preservesCurrentGraph) {
+        // The requested target may already be prepared, but it may also be a
+        // different song (Previous, shuffle, etc.). Require a fresh Start for
+        // this exact unit instead of assuming the prefetched song was chosen.
+        pendingGraphBind_ = prepared;
+        pendingGraphBind_.started = false;
+        pendingGraphBind_.awaitingSelectionStart = true;
+    }
     seekFence_ = true;
     seekFenceReleaseTick_ = GetTickCount64() + 500;
     Wake();
@@ -440,6 +449,10 @@ bool AudioCoreRuntime::RetireDirectSelectionLocked() noexcept {
     // Preserve only an already selected, identity-checked successor. Never
     // poll/rebind the retained old graph after retiring it.
     RetireCompletedCaptureLocked(converter);
+    if (pendingGraphBind_.preservesCurrentGraph) {
+        pendingGraphBind_.started = false;
+        pendingGraphBind_.awaitingSelectionStart = true;
+    }
     seekFence_ = true;
     seekFenceReleaseTick_ = GetTickCount64() + 500;
     return true;
@@ -929,6 +942,32 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
     const bool graphIdentityChanged =
         graphUnit_ != unit || graphConverter_ != candidateConverter;
     if (graphIdentityChanged) (void)RetireDirectSelectionLocked();
+    if (DeferGraphReplacementLocked()) {
+        const auto bound = boundConverter_.load(std::memory_order_acquire);
+        ConverterRegistrationSnapshot snapshot{};
+        if (candidateConverter && candidateConverter != bound &&
+            registry_.Snapshot(candidateConverter, snapshot) &&
+            snapshot.registration.outputFormat.sampleRate == sampleRate &&
+            snapshot.registration.outputFormat.channels == channels) {
+            // Apple may initialize/start the next song before the current
+            // decoder reaches EOF. Keep both the audible capture and its unit
+            // identity; otherwise a later Stop can target the wrong song.
+            const bool started = pendingGraphBind_.preservesCurrentGraph &&
+                pendingGraphBind_.unit == unit &&
+                pendingGraphBind_.registrationId == snapshot.registrationId &&
+                pendingGraphBind_.started;
+            const auto outputUnit = started ? pendingGraphBind_.outputUnit : nullptr;
+            pendingGraphBind_ = {unit, candidateConverter, snapshot.registration.observationId,
+                                 snapshot.registrationId, true, started,
+                                 sampleRate, channels, sourceBitDepth, false, outputUnit};
+            ArmPendingCaptureLocked(snapshot);
+            Wake();
+            return;
+        }
+        // Repeated initialization of the current unit is not cancellation of
+        // the separately observed successor or permission to reset its PCM.
+        if (!graphIdentityChanged && pendingGraphBind_.preservesCurrentGraph) return;
+    }
     pendingGraphBind_ = {};
     if (pendingDeferredConverter_.load(std::memory_order_acquire) &&
         pendingDeferredConverter_.load(std::memory_order_acquire) != candidateConverter) {
@@ -959,6 +998,33 @@ void AudioCoreRuntime::OnAudioUnitInitialized(void* unit, void* candidateConvert
 void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     if (!UiEnabled()) return;
     ControlScope lock(*this);
+    const bool knownPendingUnit = unit && (pendingGraphBind_.unit == unit ||
+                                           pendingGraphBind_.outputUnit == unit);
+    const bool pendingStart = pendingGraphBind_.preservesCurrentGraph &&
+        (knownPendingUnit ||
+         (graphBound_ && graphStarted_ && unit && unit != graphUnit_ &&
+          unit != graphOutputUnit_));
+    if (pendingStart) {
+        // Some Apple graphs start only their hardware-output parent. Associate
+        // that edge with the pending child instead of replacing the live parent.
+        if (unit != pendingGraphBind_.unit) pendingGraphBind_.outputUnit = unit;
+        pendingGraphBind_.started = true;
+        pendingGraphBind_.awaitingSelectionStart = false;
+        const bool skipArmed = transportSkipArmEpoch_.load(std::memory_order_acquire) != 0 &&
+            transportSkipArmGeneration_.load(std::memory_order_acquire) ==
+                boundMediaGeneration_.load(std::memory_order_acquire);
+        if (!graphBound_) {
+            TryBindPendingGraphLocked();
+        } else if (knownPendingUnit && (DirectSelectionPending() || skipArmed)) {
+            // An explicit selection followed by this exact unit's Start is a
+            // real takeover, even when Apple reuses an already prepared graph.
+            RetireCompletedCaptureLocked(boundConverter_.load(std::memory_order_acquire));
+            TryBindPendingGraphLocked();
+        } else if (unit != graphUnit_) {
+            Wake();
+            return;
+        }
+    }
     ExtendSeekQuietPeriodLocked();
     graphPaused_ = false;
     graphControlPending_ = false;
@@ -985,6 +1051,11 @@ void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
     if (!UiEnabled()) return;
     if (nativeGraphHandoffPending_.load(std::memory_order_acquire)) return;
     ControlScope lock(*this);
+    if (pendingGraphBind_.preservesCurrentGraph &&
+        (pendingGraphBind_.unit == unit || pendingGraphBind_.outputUnit == unit)) {
+        pendingGraphBind_.started = false;
+        if (unit != graphUnit_ && unit != graphOutputUnit_) return;
+    }
     // A late Stop from an older graph must not arm a drain on the successor.
     if (graphUnit_ != unit && graphOutputUnit_ != unit) return;
     ExtendSeekQuietPeriodLocked();
@@ -1037,16 +1108,27 @@ void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
 void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     if (!UiEnabled()) return;
     ControlScope lock(*this);
+    if (pendingGraphBind_.preservesCurrentGraph && pendingGraphBind_.unit == unit &&
+        unit != graphUnit_) {
+        pendingGraphBind_ = {};
+        ClearPendingCaptureLocked();
+        return;
+    }
     ExtendSeekQuietPeriodLocked();
     if (graphUnit_ != unit) return;
     (void)RetireDirectSelectionLocked();
-    pendingGraphBind_ = {};
-    ClearPendingCaptureLocked();
+    const auto successor = pendingGraphBind_;
+    const bool keepSuccessor = successor.preservesCurrentGraph && successor.unit != unit;
+    if (!keepSuccessor) {
+        pendingGraphBind_ = {};
+        ClearPendingCaptureLocked();
+    }
     graphPaused_ = false;
     graphControlPending_ = false;
     if (!endOfStreamDrainPending_ && !streamingProducerDrainPending_) {
-        RetireCaptureLocked(false);
+        RetireCaptureLocked(false, keepSuccessor);
     }
+    if (keepSuccessor) pendingGraphBind_ = successor;
     graphUnit_ = nullptr;
     graphOutputUnit_ = nullptr;
     graphConverter_ = nullptr;
@@ -1668,7 +1750,23 @@ AudioCoreRuntimeStats AudioCoreRuntime::Stats() const noexcept {
     };
 }
 
+bool AudioCoreRuntime::DeferGraphReplacementLocked() const noexcept {
+    if (!graphBound_) return false;
+    if (endOfStreamDrainPending_ || streamingProducerDrainPending_) return true;
+    const bool skipArmed = transportSkipArmEpoch_.load(std::memory_order_acquire) != 0 &&
+        transportSkipArmGeneration_.load(std::memory_order_acquire) ==
+            boundMediaGeneration_.load(std::memory_order_acquire);
+    return graphStarted_ && !graphPaused_ && !graphControlPending_ && !userPauseIntent_ &&
+           !seekFence_ && !DirectSelectionPending() && !skipArmed &&
+           coordinator_.Phase() != AudioCoreGatePhase::Off &&
+           coordinator_.Phase() != AudioCoreGatePhase::Faulted;
+}
+
 void AudioCoreRuntime::TryBindGraphLocked() noexcept {
+    // While waiting for successor precision/a producer lease, unrelated
+    // callbacks must not rediscover and rebind the retained old graph.
+    if (pendingGraphBind_.awaitingSelectionStart ||
+        (!graphBound_ && pendingGraphBind_.preservesCurrentGraph)) return;
     if (!UiEnabled() || !graphUnit_ || graphRate_ < 8000 || graphRate_ > 768000 ||
         graphChannels_ != 2) return;
     if (!graphConverter_ && graphSourceBits_ != 0) {
@@ -1681,7 +1779,7 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     if (!registry_.Snapshot(graphConverter_, snapshot)) return;
     // Remember the exact observed successor, not a general permission to retry
     // any unbound graph. Keep the old queue/sink until its own drain completes.
-    if ((endOfStreamDrainPending_ || streamingProducerDrainPending_) && graphBound_) {
+    if (DeferGraphReplacementLocked()) {
         if (graphConverter_ != boundConverter_.load(std::memory_order_acquire)) {
             pendingGraphBind_ = {graphUnit_, graphConverter_, snapshot.registration.observationId,
                                  snapshot.registrationId};
@@ -2060,10 +2158,12 @@ void AudioCoreRuntime::RetireCompletedCaptureLocked(void* converter) noexcept {
     const auto successor = pendingGraphBind_;
     RetireCaptureLocked(true, true);
     if (graphConverter_ == converter) graphConverter_ = nullptr;
-    // Only natural completion/producer disposal may carry a blocked successor
-    // across retirement. Skip, seek, rejection and UI Off use plain retirement.
+    // Natural retirement can carry the observed successor. Explicit selection
+    // additionally requires a fresh target Start; seek, rejection and UI Off
+    // discard the pending identity and PCM through plain retirement.
     if (successor.converter && successor.converter != converter &&
-        successor.unit == graphUnit_ && successor.converter == graphConverter_) {
+        (successor.preservesCurrentGraph ||
+         (successor.unit == graphUnit_ && successor.converter == graphConverter_))) {
         pendingGraphBind_ = successor;
     } else {
         ClearPendingCaptureLocked();
@@ -2071,14 +2171,20 @@ void AudioCoreRuntime::RetireCompletedCaptureLocked(void* converter) noexcept {
 }
 
 void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
-    if (graphBound_ || !pendingGraphBind_.converter) return;
+    if (graphBound_ || !pendingGraphBind_.converter ||
+        pendingGraphBind_.awaitingSelectionStart) return;
     const auto successor = pendingGraphBind_;
     ConverterRegistrationSnapshot snapshot{};
-    if (UiEnabled() && successor.unit == graphUnit_ &&
-        successor.converter == graphConverter_ &&
+    if (UiEnabled() && (successor.preservesCurrentGraph ||
+        (successor.unit == graphUnit_ && successor.converter == graphConverter_)) &&
         registry_.Snapshot(successor.converter, snapshot) &&
         snapshot.registration.observationId == successor.observationId &&
-        snapshot.registrationId == successor.registrationId) {
+        snapshot.registrationId == successor.registrationId &&
+        (!successor.preservesCurrentGraph ||
+         (successor.sampleRate == snapshot.registration.outputFormat.sampleRate &&
+          successor.channels == snapshot.registration.outputFormat.channels &&
+          (successor.sourceBitDepth == 0 || snapshot.registration.sourceBitDepth == 0 ||
+           successor.sourceBitDepth == snapshot.registration.sourceBitDepth)))) {
         if (snapshot.registration.sourceBitDepth == 0) return;
         if (callbacks_.tryAcquireProducer && !callbacks_.tryAcquireProducer(callbacks_.context)) return;
         struct Lease final {
@@ -2090,6 +2196,17 @@ void AudioCoreRuntime::TryBindPendingGraphLocked() noexcept {
             }
         } lease{*this};
         pendingProducerLeaseHeld_ = true;
+        if (successor.preservesCurrentGraph) {
+            graphUnit_ = successor.unit;
+            graphOutputUnit_ = successor.outputUnit;
+            graphConverter_ = successor.converter;
+            graphRate_ = successor.sampleRate;
+            graphChannels_ = successor.channels;
+            graphSourceBits_ = snapshot.registration.sourceBitDepth;
+            graphObservationId_ = successor.observationId;
+            graphStarted_ = successor.started;
+            pendingGraphBind_.preservesCurrentGraph = false;
+        }
         // One attempt only. Missing precision is retried by its existing
         // observation callback; a rejected item must not fault every tick.
         TryBindGraphLocked();
