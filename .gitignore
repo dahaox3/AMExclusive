@@ -5,6 +5,8 @@
 /artifacts/
 /scripts/
 /mod/tests/*
+!/mod/tests/OutputSelectionTests.cpp
+!/mod/tests/InstallerOutputSelection.Tests.ps1
 !/mod/tests/WasapiDrainProbe.cpp
 !/mod/tests/README.md
 !/mod/tests/RegressionTests.cpp

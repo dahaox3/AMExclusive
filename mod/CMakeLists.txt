@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(AMExclusive VERSION 0.3.5 LANGUAGES CXX RC)
+project(AMExclusive VERSION 0.3.6 LANGUAGES CXX RC)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "AMExclusive supports Windows x64 only")
@@ -182,6 +182,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/src/output_device/CMakeLists.txt" OPTIONAL)
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(am_exclusive_output_selection_tests tests/OutputSelectionTests.cpp)
+  target_include_directories(am_exclusive_output_selection_tests PRIVATE src)
+  target_compile_definitions(am_exclusive_output_selection_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_link_libraries(am_exclusive_output_selection_tests PRIVATE ole32)
+  add_test(NAME output_selection COMMAND am_exclusive_output_selection_tests)
+  add_test(NAME installer_output_selection COMMAND "${POWERSHELL_EXECUTABLE}"
+    -NoProfile -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/tests/InstallerOutputSelection.Tests.ps1")
   add_executable(am_exclusive_asio_tests tests/AsioOutputTests.cpp
     src/audio_v2/AsioExclusiveSink.cpp src/output_device/AsioDevices.cpp)
   target_include_directories(am_exclusive_asio_tests PRIVATE src)

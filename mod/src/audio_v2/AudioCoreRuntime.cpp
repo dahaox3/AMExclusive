@@ -1,4 +1,5 @@
 #include "AudioCoreRuntime.h"
+#include "../output_device/AsioDevices.h"
 #include "../AudioErrors.h"
 #include "../AudioFormatPolicy.h"
 
@@ -229,11 +230,15 @@ void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds)
     hardwareBufferMs_.store(milliseconds, std::memory_order_release);
 }
 
-void AudioCoreRuntime::SetAsioDriver(std::wstring_view clsid) {
+void AudioCoreRuntime::SetOutputDevice(std::wstring_view route) {
     ControlScope lock(*this);
-    if (asioDriverClsid_ == clsid) return;
+    const bool asio = output_device::IsAsioRoute(route);
+    const auto endpoint = asio ? std::wstring_view{} : route;
+    const auto clsid = asio ? route.substr(output_device::kAsioPrefix.size()) : std::wstring_view{};
+    if (selectedEndpoint_ == endpoint && asioDriverClsid_ == clsid) return;
+    selectedEndpoint_.assign(endpoint);
     asioDriverClsid_.assign(clsid);
-    coordinator_.SetAsioDriver(clsid);
+    coordinator_.SetOutputDevice(endpoint, clsid);
 }
 
 void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
@@ -1177,7 +1182,7 @@ void AudioCoreRuntime::OnAudioUnitUninitialized(void* unit) noexcept {
     Wake();
 }
 
-void AudioCoreRuntime::OnNativeClientInitialized(void* client, const wchar_t* endpoint,
+void AudioCoreRuntime::OnNativeClientInitialized(void* client, const wchar_t*,
                                                   AUDCLNT_SHAREMODE, DWORD,
                                                   const WAVEFORMATEX*, HRESULT result) noexcept {
     if (!UiEnabled() || FAILED(result) || !client) return;
@@ -1186,7 +1191,6 @@ void AudioCoreRuntime::OnNativeClientInitialized(void* client, const wchar_t* en
     nativeClient_.store(client, std::memory_order_release);
     nativeInitialized_ = true;
     nativeStarted_ = false;
-    nativeEndpoint_ = endpoint ? endpoint : L"";
     Wake();
 }
 
@@ -1882,7 +1886,6 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
     PcmFormat format{};
     if (!BuildFormat(snapshot, format)) return;
     AudioCoreCoordinatorConfig config{};
-    config.followDefaultEndpointOnResume = true;
     config.sink.format = format;
     config.sink.allowResampling = allowConversion;
     // A new generation after a known pause reopens the physical stream. Keep
@@ -1904,7 +1907,8 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             PcmEncoding::SignedInteger, true,
             static_cast<std::uint16_t>(snapshot.registration.sourceBitDepth)};
     }
-    config.sink.endpointId = nativeEndpoint_;
+    config.sink.endpointId = selectedEndpoint_;
+    config.sink.useDefaultIfUnavailable = true;
     config.sink.asioDriverClsid = asioDriverClsid_;
     config.sink.periodFrames = asioDriverClsid_.empty() ? PeriodFrames(format.sampleRate) : 0;
     config.sink.alignmentRetries = 3;

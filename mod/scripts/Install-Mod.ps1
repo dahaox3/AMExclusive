@@ -170,30 +170,52 @@ $wasRunning = [bool](Get-Process AppleMusic -ErrorAction SilentlyContinue |
 Stop-AppleMusicRuntime
 Write-ProgressMilestone 32 'stop_runtime'
 
-$preservedMode = $null
+function Get-PreviousOutputSelection([string[]]$Lines) {
+    $mode = 'shared'
+    $route = ''
+    foreach ($line in $Lines) {
+        if ($line -match '^\s*output_selection\s*=(.*)$') {
+            $selection = $Matches[1]
+            if ($selection -cnotmatch '^(shared:|exclusive:)([^\x00\r\n]{0,255})$') { return 'shared:' }
+            $modePrefix = $Matches[1]
+            $endpoint = $Matches[2]
+            if ($endpoint.StartsWith('asio:', [StringComparison]::Ordinal)) {
+                $guid = [Guid]::Empty
+                if (-not [Guid]::TryParseExact($endpoint.Substring(5), 'B', [ref]$guid) -or
+                    $guid -eq [Guid]::Empty) { return 'shared:' }
+                $endpoint = 'asio:' + $guid.ToString('B').ToUpperInvariant()
+            }
+            return $modePrefix + $endpoint
+        }
+        if ($line -match '^\s*mode\s*=\s*(probe|exclusive)\s*$') {
+            $mode = if ($Matches[1] -eq 'exclusive') { 'exclusive' } else { 'shared' }
+        }
+        if ($line -match '^\s*asio_driver\s*=\s*(\{[0-9a-fA-F-]{36}\})\s*$') {
+            $guid = [Guid]::Empty
+            if ([Guid]::TryParseExact($Matches[1], 'B', [ref]$guid) -and $guid -ne [Guid]::Empty) {
+                $route = 'asio:' + $guid.ToString('B').ToUpperInvariant()
+            }
+        }
+    }
+    return $mode + ':' + $route
+}
+
+$outputSelection = 'shared:'
 $preservedPeriod100ns = $null
 $preservedAllowResampling = $null
 $preservedSourceSampleRate = $null
-$preservedAsioDriver = $null
 foreach ($existingIni in @(
     (Join-Path $install 'am-exclusive.ini')
 )) {
     if (-not (Test-Path -LiteralPath $existingIni -PathType Leaf)) { continue }
-    foreach ($line in [IO.File]::ReadAllLines($existingIni)) {
-        if ($line -match '^\s*mode\s*=\s*(probe|exclusive)\s*$') {
-            $preservedMode = $Matches[1].ToLowerInvariant()
-        }
+    $iniLines = [IO.File]::ReadAllLines($existingIni)
+    $outputSelection = Get-PreviousOutputSelection $iniLines
+    foreach ($line in $iniLines) {
         if ($line -match '^\s*allow_resampling\s*=\s*([01])\s*$') {
             $preservedAllowResampling = [int]$Matches[1]
         }
         if ($line -match '^\s*max_source_sample_rate\s*=\s*(48000|96000|192000)\s*$') {
             $preservedSourceSampleRate = [int]$Matches[1]
-        }
-        if ($line -match '^\s*asio_driver\s*=\s*(\{[0-9a-fA-F-]{36}\})\s*$') {
-            $parsedDriver = [Guid]::Empty
-            if ([Guid]::TryParseExact($Matches[1], 'B', [ref]$parsedDriver)) {
-                $preservedAsioDriver = $parsedDriver.ToString('B').ToUpperInvariant()
-            }
         }
         if ($line -match '^\s*period_100ns\s*=\s*(\d+)\s*$') {
             [uint64]$candidatePeriod = 0
@@ -203,8 +225,6 @@ foreach ($existingIni in @(
             }
         }
     }
-    if ($preservedMode -and $preservedPeriod100ns -and
-        $null -ne $preservedAllowResampling -and $null -ne $preservedSourceSampleRate) { break }
 }
 
 if (Test-Path -LiteralPath $install -PathType Container) {
@@ -228,44 +248,23 @@ foreach ($name in $payloadFiles) {
     Copy-Item -LiteralPath (Join-Path $source $name) -Destination $destination -Force
     if ((Get-Sha256Hex $destination) -ne $expectedHashes[$name]) { throw (Get-InstallerText "发布文件验证失败：$name" "Payload verification failed: $name") }
 }
-if ($preservedMode) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
-    $iniText = [Text.RegularExpressions.Regex]::Replace(
-        $iniText, '(?m)^\s*mode\s*=.*$', "mode=$preservedMode")
-    $utf8NoBom = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
-}
+$iniPath = Join-Path $install 'am-exclusive.ini'
+$iniText = [IO.File]::ReadAllText($iniPath)
 if ($preservedPeriod100ns) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
     $iniText = [Text.RegularExpressions.Regex]::Replace(
         $iniText, '(?m)^\s*period_100ns\s*=.*$', "period_100ns=$preservedPeriod100ns")
-    $utf8NoBom = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
 }
 if ($null -ne $preservedAllowResampling) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
     $iniText = [Text.RegularExpressions.Regex]::Replace(
         $iniText, '(?m)^\s*allow_resampling\s*=.*$', "allow_resampling=$preservedAllowResampling")
-    $utf8NoBom = New-Object Text.UTF8Encoding($false)
-    [IO.File]::WriteAllText($iniPath, $iniText, $utf8NoBom)
 }
 if ($null -ne $preservedSourceSampleRate) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
     $iniText = [Text.RegularExpressions.Regex]::Replace(
         $iniText, '(?m)^\s*max_source_sample_rate\s*=.*$', "max_source_sample_rate=$preservedSourceSampleRate")
-    [IO.File]::WriteAllText($iniPath, $iniText, (New-Object Text.UTF8Encoding($false)))
 }
-if ($preservedAsioDriver) {
-    $iniPath = Join-Path $install 'am-exclusive.ini'
-    $iniText = [IO.File]::ReadAllText($iniPath)
-    $iniText = [Text.RegularExpressions.Regex]::Replace(
-        $iniText, '(?m)^asio_driver=.*$', "asio_driver=$preservedAsioDriver")
-    [IO.File]::WriteAllText($iniPath, $iniText, (New-Object Text.UTF8Encoding($false)))
-}
+$iniText = $iniText.Replace('output_selection=shared:', 'output_selection=' + $outputSelection)
+# The Win32 profile APIs preserve opaque Unicode endpoint IDs in a UTF-16 INI.
+[IO.File]::WriteAllText($iniPath, $iniText, [Text.Encoding]::Unicode)
 # Only this file is intentionally transformed to preserve the user's settings.
 $expectedHashes['am-exclusive.ini'] = Get-Sha256Hex (Join-Path $install 'am-exclusive.ini')
 foreach ($script in $installerScripts) {

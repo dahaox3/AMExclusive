@@ -47,14 +47,14 @@ HRESULT STDMETHODCALLTYPE RedirectGetDefaultAudioEndpoint(IMMDeviceEnumerator* s
         return result;
     }
     const auto selected = Store().Read();
-    if (selected.empty() || IsAsioRoute(selected)) return result;
-    if (auto* redirected = OpenActiveRenderEndpoint(self, selected)) {
+    if (!selected || selected->endpoint.empty() || IsAsioRoute(selected->endpoint)) return result;
+    if (auto* redirected = OpenActiveRenderEndpoint(self, selected->endpoint)) {
         (*device)->Release();
         *device = redirected;
         Log(L"default render endpoint redirected role=" + std::to_wstring(static_cast<int>(role)) +
-            L" endpoint=" + selected);
+            L" endpoint=" + selected->endpoint);
     } else if (!g_loggedUnavailable.exchange(true)) {
-        Log(L"selected endpoint unavailable; keeping Windows default endpoint=" + selected);
+        Log(L"selected endpoint unavailable; keeping Windows default endpoint=" + selected->endpoint);
     }
     return result;
 }

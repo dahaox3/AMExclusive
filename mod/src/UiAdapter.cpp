@@ -1,6 +1,7 @@
 #include "BoundedLog.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
+#include "output_device/OutputDeviceUi.h"
 #include "UiRefreshState.h"
 #include "UiPlaybackState.h"
 #include "TrackSelectionGesture.h"
@@ -67,7 +68,6 @@ Message g_status{};
 std::atomic<bool> g_connected{};
 std::atomic<bool> g_suppressToggle{};
 std::atomic<int> g_programmaticToggleValue{-1};
-std::atomic<int> g_pendingEnabled{-1};
 std::atomic<int> g_pendingHardwareBufferMs{-1};
 std::atomic<int> g_requestedHardwareBufferMs{-1};
 std::atomic<ULONGLONG> g_hardwareBufferAckDeadlineTick{};
@@ -225,9 +225,8 @@ Message StatusSnapshot() {
 }
 
 bool SendEnabled(bool enabled) {
-    if (!g_connected.load()) return false;
-    g_pendingEnabled.store(enabled ? 1 : 0);
-    return true;
+    return g_connected.load() && StatusSnapshot().minor >= 4 &&
+           ammod::output_device::SetOutputExclusive(enabled);
 }
 
 bool SendHardwareBuffer(std::uint32_t milliseconds) {
@@ -2222,21 +2221,6 @@ DWORD WINAPI PipeThread(void*) {
                 }
             }
 
-            const int pending = g_pendingEnabled.exchange(-1);
-            if (pending >= 0) {
-                auto message = NewMessage(MessageType::SetEnabled, Role::Ui);
-                message.uiPid = GetCurrentProcessId();
-                message.enabledIntent = pending ? 1 : 0;
-                bool written{};
-                {
-                    std::lock_guard writeLock(g_pipeWriteMutex);
-                    written = WriteMessage(pipe, message);
-                }
-                if (!written) {
-                    g_pendingEnabled.store(pending);
-                    break;
-                }
-            }
             const int pendingHardwareBufferMs = g_pendingHardwareBufferMs.exchange(-1);
             if (pendingHardwareBufferMs >= 0) {
                 auto message = NewMessage(MessageType::SetHardwareBuffer, Role::Ui);

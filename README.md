@@ -4,6 +4,8 @@
 
 # AMExclusive
 
+**0.3.6 remembers your output device.** The output menu restores Windows default, a specific shared or exclusive WASAPI endpoint, or your ASIO driver when Apple Music reopens. The upgrade carries over an existing ASIO selection. An unavailable WASAPI endpoint stays selected while playback temporarily uses the Windows default. Exclusive output opens when music plays.
+
 **0.3.5 fixes silence after a natural track change.** Apple Music can start the next song's hardware output while AMExclusive is still draining the previous song. The player now retains that start through the handoff, including when the two songs use different sample rates.
 
 **0.3.4 adds ASIO output, manual track selection and a streaming tail fix.** Choose the installed x64 driver under **Output device → [ASIO]**. Each song opens the driver at the selected Apple source rate. The driver supplies the channel format, preferred buffer size and output latency each time it opens. Pause frees the driver for other apps. A driver reset or buffer-size change during playback triggers renegotiation. The default Apple lossless source ceiling is 96 kHz. Local rate conversion remains opt-in.

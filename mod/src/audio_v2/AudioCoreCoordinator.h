@@ -24,7 +24,6 @@ struct AudioCoreCoordinatorConfig final {
     std::uint64_t mediaGeneration{1};
     PcmMappingPolicy mappingPolicy{PcmMappingPolicy::ExactSourceInteger};
     bool verifyBitPerfect{};
-    bool followDefaultEndpointOnResume{};
 };
 
 struct AudioCoreCoordinatorStats final {
@@ -67,7 +66,7 @@ public:
     HRESULT Start() noexcept;
     void PauseEndpoint() noexcept;
     HRESULT ResumeEndpoint() noexcept;
-    void SetAsioDriver(std::wstring_view clsid);
+    void SetOutputDevice(std::wstring_view endpoint, std::wstring_view clsid);
     bool EndpointReleased() const noexcept { return endpointReleased_; }
 
     bool ShouldSuppressNative() const noexcept;

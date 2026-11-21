@@ -18,8 +18,6 @@
 #include "LosslessQualityLock.h"
 #include "LosslessQualityPolicy.h"
 #include "UiPlaybackState.h"
-#include "output_device/SelectedEndpoint.h"
-#include "output_device/AsioDevices.h"
 #include "audio_v2/AudioCoreGate.h"
 #include "audio_v2/AudioCoreRuntime.h"
 #include "audio_v2/NativeRenderGateProxy.h"
@@ -3551,7 +3549,6 @@ DWORD WINAPI PipeClientLoop(void*) {
     using namespace ammod::ipc;
     const auto name = PipeName();
     if (name.empty()) return 1;
-    ammod::output_device::SelectedEndpointStore selectedEndpoint;
     Message appliedSettings{};
     std::wstring appliedEndpoint;
     bool haveAppliedSettings = false;
@@ -3608,8 +3605,8 @@ DWORD WINAPI PipeClientLoop(void*) {
                 if (GetLastError() == ERROR_TIMEOUT) continue;
                 break;
             }
-            if (incoming.type == MessageType::HelloAck && incoming.minor < 3) {
-                Log(L"broker lacks source sample-rate limit support; connection retired");
+            if (incoming.type == MessageType::HelloAck && incoming.minor < 4) {
+                Log(L"broker lacks persisted output selection support; connection retired");
                 break;
             }
             if (incoming.type == MessageType::StatusChanged) {
@@ -3629,10 +3626,9 @@ DWORD WINAPI PipeClientLoop(void*) {
                     (incoming.agentPid == 0 || incoming.agentPid == GetCurrentProcessId());
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
-                const auto endpoint = selectedEndpoint.Read();
-                const std::wstring_view route(endpoint);
-                g_audioCoreRuntime.SetAsioDriver(ammod::output_device::IsAsioRoute(route)
-                    ? route.substr(ammod::output_device::kAsioPrefix.size()) : std::wstring_view{});
+                const std::wstring_view route(incoming.endpointId,
+                    wcsnlen_s(incoming.endpointId, std::size(incoming.endpointId)));
+                g_audioCoreRuntime.SetOutputDevice(route);
                 g_audioCoreRuntime.SetHardwareBufferMilliseconds(hardwareBufferMs);
                 g_audioCoreRuntime.SetAllowResampling(incoming.allowResampling != 0);
                 g_ipcEnabled.store(enabled, std::memory_order_release);
@@ -3641,15 +3637,21 @@ DWORD WINAPI PipeClientLoop(void*) {
                 g_audioCoreRuntime.SetUiEnabled(enabled);
                 const bool owner = incoming.agentPid == GetCurrentProcessId();
                 if (!owner) cancelRestart();
+                const bool outputChanged = appliedSettings.enabledIntent != incoming.enabledIntent ||
+                                           appliedEndpoint != route;
+                if (owner && (!haveAppliedSettings || appliedSettings.agentPid != incoming.agentPid ||
+                              outputChanged)) {
+                    Log(L"output selection applied exclusive=" + std::to_wstring(incoming.enabledIntent) +
+                        L" endpoint=" + (route.empty() ? std::wstring(L"<default>") : std::wstring(route)));
+                }
                 const bool settingsChanged = haveAppliedSettings &&
                     appliedSettings.agentPid == incoming.agentPid &&
                     (appliedSettings.maxSourceSampleRate != incoming.maxSourceSampleRate ||
                      appliedSettings.hardwareBufferMs != incoming.hardwareBufferMs ||
                      appliedSettings.allowResampling != incoming.allowResampling ||
-                     appliedSettings.enabledIntent != incoming.enabledIntent ||
-                     appliedEndpoint != endpoint);
+                     outputChanged);
                 appliedSettings = incoming;
-                appliedEndpoint = endpoint;
+                appliedEndpoint = route;
                 haveAppliedSettings = true;
                 // All settings are applied before requesting a new Apple source.
                 // Only the elected Agent may launch this; helper requests coalesce.

@@ -15,6 +15,7 @@ class CaptureEndpoint final : public IPlaybackSink {
 public:
     HRESULT Open(const WasapiSinkConfig& config) noexcept override {
         format = config.format;
+        endpoint = config.endpointId;
         state = WasapiSinkState::Open;
         return S_OK;
     }
@@ -38,6 +39,7 @@ public:
     bool EndOfStreamComplete() const noexcept override { return false; }
     void SetResumeBlocked(bool) noexcept override {}
     std::array<std::int32_t, 4> stereo{};
+    std::wstring endpoint;
 private:
     PcmFormat format{};
     WasapiSinkState state{WasapiSinkState::Closed};
@@ -93,6 +95,8 @@ struct AudioCoreRuntimeRegression {
                 const auto nextParent = reuseParent ? parent : reinterpret_cast<void*>(0x4600);
                 const auto oldClient = reinterpret_cast<void*>(0x4400);
                 const auto nextClient = reinterpret_cast<void*>(0x4500);
+                const std::wstring savedEndpoint = L"saved WASAPI endpoint";
+                r.SetOutputDevice(savedEndpoint);
                 Register(r, old); Bind(r, old);
                 const auto child = r.graphUnit_;
                 r.OnAudioUnitStarted(parent);
@@ -139,6 +143,7 @@ struct AudioCoreRuntimeRegression {
                     Check(c.PushP0Interleaved(2 + n * kMaxBlockFrames, pcm.data(), kMaxBlockFrames, false, false),
                           "real prebuffer for the successor");
                 r.TryActivateLocked();
+                Check(output.endpoint == savedEndpoint, "first open uses the saved WASAPI endpoint");
                 Check(c.Phase() == AudioCoreGatePhase::Active && output.Format().sampleRate == 48000 &&
                       output.stereo == std::array<std::int32_t, 4>{0x20000000, -0x20000000, 0x40000000, -0x40000000},
                       "48 kHz endpoint starts and receives the original successor stereo samples");

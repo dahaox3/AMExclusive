@@ -188,10 +188,13 @@ void AudioCoreCoordinator::SelectConfiguredSink() noexcept {
                                                      : static_cast<IPlaybackSink*>(&asio_));
 }
 
-void AudioCoreCoordinator::SetAsioDriver(std::wstring_view clsid) {
-    if (config_.sink.asioDriverClsid == clsid) return;
+void AudioCoreCoordinator::SetOutputDevice(std::wstring_view endpoint, std::wstring_view clsid) {
+    config_.sink.endpointId.assign(endpoint);
     config_.sink.asioDriverClsid.assign(clsid);
-    if (endpointReleased_) resumeConfig_.asioDriverClsid.assign(clsid);
+    if (endpointReleased_) {
+        resumeConfig_.endpointId.assign(endpoint);
+        resumeConfig_.asioDriverClsid.assign(clsid);
+    }
     // An active backend keeps its callback ownership through Stop/Close.
     if (Output().State() == WasapiSinkState::Closed) SelectConfiguredSink();
 }
@@ -201,9 +204,6 @@ void AudioCoreCoordinator::PauseEndpoint() noexcept {
         !endpointReleased_ && Output().State() != WasapiSinkState::Closed) {
         resumeConfig_ = config_.sink;
         resumeFormat_ = Output().Format();
-        // Re-query the selected/default route on resume: a video application
-        // may have changed the Windows endpoint while music was paused.
-        if (config_.followDefaultEndpointOnResume) resumeConfig_.endpointId.clear();
         resumeConfig_.primeWithSilence = true;
         (void)Output().DrainAndClose();
         SelectConfiguredSink();

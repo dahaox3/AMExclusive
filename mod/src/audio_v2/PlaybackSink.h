@@ -32,6 +32,7 @@ struct WasapiSinkConfig final {
     std::array<PcmFormat, kMaxFormatCandidates> formatCandidates{};
     std::uint32_t formatCandidateCount{};
     std::wstring endpointId;
+    bool useDefaultIfUnavailable{};
     std::wstring asioDriverClsid; // Empty selects WASAPI.
     std::uint32_t periodFrames{};
     std::uint32_t alignmentRetries{2};

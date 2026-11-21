@@ -2,6 +2,7 @@
 #include "IpcTransport.h"
 #include "LosslessQualityPolicy.h"
 #include "output_device/OutputDeviceLog.h"
+#include "output_device/OutputDeviceUi.h"
 #include "output_device/SelectedEndpoint.h"
 #include "output_device/AsioDevices.h"
 
@@ -53,7 +54,7 @@ constexpr DWORD kAttachIntervalMs = 1500;
 std::mutex g_statusMutex;
 Message g_status{};
 bool g_haveStatus{};
-std::atomic<int> g_pendingIntent{-1};
+std::atomic<bool> g_outputSelectionChanged{};
 // Publish the desired rate and its confirmation serial atomically, so a stale
 // 96 -> 48 -> 96 acknowledgement cannot erase the most recent click.
 std::atomic<std::uint64_t> g_sourceRateRequest{};
@@ -209,25 +210,28 @@ std::vector<RenderEndpoint> EnumerateRenderEndpoints() {
 void SelectOutputDevice(const std::wstring& endpointId, bool exclusive) {
     Log(L"user selected output device exclusive=" + std::to_wstring(exclusive) +
         L" endpoint=" + (endpointId.empty() ? std::wstring(L"<default>") : endpointId));
-    if (!Store().Write(endpointId)) {
+    if (!Store().Write({endpointId, exclusive})) {
         Log(L"selected endpoint store write failed");
         return;
     }
-    // Also publish same-mode device changes so the Agent applies/reopens them.
-    g_pendingIntent.store(exclusive ? 1 : 0);
+    g_outputSelectionChanged.store(true);
 }
 
 Controls::RadioMenuFlyoutItem MakeOutputDeviceItem(const std::wstring& text, const std::wstring& endpointId,
                                                    bool exclusive, const std::wstring& selected,
                                                    bool currentlyExclusive, bool enabled) {
-    const bool current = selected == endpointId && currentlyExclusive == exclusive;
+    const bool sameChoice = selected == endpointId && currentlyExclusive == exclusive;
+    // Disabling exclusive playback keeps the ASIO driver for re-enabling it.
+    // While disabled the effective shared output follows the Windows default.
+    const bool current = sameChoice || (!currentlyExclusive && !exclusive &&
+        endpointId.empty() && IsAsioRoute(selected));
     Controls::RadioMenuFlyoutItem item;
     item.Text(hstring(text));
     item.GroupName(L"AMExclusiveOutputDevice");
     item.IsChecked(current);
     item.IsEnabled(enabled);
-    item.Click([endpointId, exclusive, current](auto&&, auto&&) {
-        if (!current) SelectOutputDevice(endpointId, exclusive);
+    item.Click([endpointId, exclusive, sameChoice](auto&&, auto&&) {
+        if (!sameChoice) SelectOutputDevice(endpointId, exclusive);
     });
     return item;
 }
@@ -235,9 +239,10 @@ Controls::RadioMenuFlyoutItem MakeOutputDeviceItem(const std::wstring& text, con
 void RebuildOutputDeviceMenu(const Controls::MenuFlyout& flyout) {
     bool brokerAvailable{};
     const auto status = StatusSnapshot(brokerAvailable);
-    const bool currentlyExclusive = status.enabledIntent != 0;
-    const bool enabled = brokerAvailable && !InTransition(status);
-    const auto selected = Store().Read();
+    const auto preference = Store().Read();
+    const bool currentlyExclusive = preference ? preference->exclusive : status.enabledIntent != 0;
+    const std::wstring selected = preference ? preference->endpoint : status.endpointId;
+    const bool enabled = brokerAvailable && status.minor >= 4 && preference && !InTransition(status);
     auto items = flyout.Items();
     items.Clear();
     items.Append(MakeOutputDeviceItem(Localized(L"默认", L"Default"), {}, false, selected,
@@ -247,7 +252,9 @@ void RebuildOutputDeviceMenu(const Controls::MenuFlyout& flyout) {
         items.Append(MakeOutputDeviceItem(endpoint.name, endpoint.id, false, selected,
                                           currentlyExclusive, enabled));
     }
-    if (!endpoints.empty()) items.Append(Controls::MenuFlyoutSeparator());
+    items.Append(Controls::MenuFlyoutSeparator());
+    items.Append(MakeOutputDeviceItem(Localized(L"[独占] 默认", L"[Exclusive] Default"), {}, true,
+                                      selected, currentlyExclusive, enabled));
     for (const auto& endpoint : endpoints) {
         items.Append(MakeOutputDeviceItem(Localized(L"[独占] ", L"[Exclusive] ") + endpoint.name,
                                           endpoint.id, true, selected, currentlyExclusive, enabled));
@@ -257,6 +264,19 @@ void RebuildOutputDeviceMenu(const Controls::MenuFlyout& flyout) {
     for (const auto& driver : asioDrivers) {
         items.Append(MakeOutputDeviceItem(L"[ASIO] " + driver.name,
             std::wstring(kAsioPrefix) + driver.clsid, true, selected, currentlyExclusive, enabled));
+    }
+    const bool missingWasapi = !selected.empty() && !IsAsioRoute(selected) &&
+        std::none_of(endpoints.begin(), endpoints.end(), [&](const auto& e) { return e.id == selected; });
+    const bool missingAsio = currentlyExclusive && IsAsioRoute(selected) &&
+        std::none_of(asioDrivers.begin(), asioDrivers.end(), [&](const auto& d) {
+            return std::wstring_view(selected).substr(kAsioPrefix.size()) == d.clsid;
+        });
+    if (missingWasapi || missingAsio) {
+        auto item = MakeOutputDeviceItem(Localized(L"上次选择的设备（当前不可用）",
+            L"Last selected device (unavailable)"), selected, currentlyExclusive, selected,
+            currentlyExclusive, false);
+        Controls::ToolTipService::SetToolTip(item, box_value(hstring(selected)));
+        items.Append(item);
     }
     items.Append(Controls::MenuFlyoutSeparator());
     Controls::MenuFlyoutItem heading;
@@ -436,6 +456,9 @@ DWORD WINAPI BrokerThread(void*) {
         }
         Log(L"controller connected to broker");
         std::uint64_t lastGeneration = 0;
+        bool selectionSupported = false;
+        bool awaitingSelection = false;
+        ULONGLONG nextSelectionSend{};
         ULONGLONG nextSourceLimitSend{};
         Message incoming{};
         for (;;) {
@@ -448,18 +471,28 @@ DWORD WINAPI BrokerThread(void*) {
                 if (!ammod::ipc::WriteMessage(pipe, request)) break;
                 nextSourceLimitSend = GetTickCount64() + 1000;
             }
-            if (const int pending = g_pendingIntent.exchange(-1); pending >= 0) {
-                auto request = ammod::ipc::NewMessage(MessageType::SetEnabled, Role::Controller);
-                request.uiPid = GetCurrentProcessId();
-                request.enabledIntent = static_cast<std::uint8_t>(pending);
-                if (!ammod::ipc::WriteMessage(pipe, request)) {
-                    g_pendingIntent.store(pending);
-                    break;
-                }
+            if (selectionSupported && g_outputSelectionChanged.exchange(false)) {
+                awaitingSelection = true;
+                nextSelectionSend = 0;
+            }
+            if (awaitingSelection && GetTickCount64() >= nextSelectionSend) {
+                const auto request = ammod::ipc::NewMessage(MessageType::OutputSelectionChanged,
+                                                            Role::Controller);
+                if (!ammod::ipc::WriteMessage(pipe, request)) break;
+                nextSelectionSend = GetTickCount64() + 1000;
             }
             if (!ammod::ipc::ReadMessageTimeout(pipe, incoming, 100)) {
                 if (GetLastError() == ERROR_TIMEOUT) continue;
                 break;
+            }
+            if (incoming.type == MessageType::HelloAck && incoming.role == Role::Broker) {
+                selectionSupported = incoming.minor >= 4;
+                g_outputSelectionChanged.store(true);
+            } else if (awaitingSelection && incoming.type == MessageType::StatusChanged &&
+                       incoming.role == Role::Broker && incoming.generation >= lastGeneration) {
+                const auto saved = Store().Read();
+                if (saved && saved->exclusive == (incoming.enabledIntent != 0) &&
+                    saved->endpoint == incoming.endpointId) awaitingSelection = false;
             }
             PublishStatus(incoming, lastGeneration);
         }
@@ -491,4 +524,11 @@ const bool g_started = [] {
 }();
 
 } // namespace
+
+bool SetOutputExclusive(bool exclusive) {
+    if (!Store().SetExclusive(exclusive)) return false;
+    g_outputSelectionChanged.store(true);
+    return true;
+}
+
 } // namespace ammod::output_device

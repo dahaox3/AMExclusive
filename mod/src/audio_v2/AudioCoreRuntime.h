@@ -137,7 +137,7 @@ public:
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
     void SetAllowResampling(bool enabled) noexcept;
-    void SetAsioDriver(std::wstring_view clsid);
+    void SetOutputDevice(std::wstring_view route);
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -415,7 +415,7 @@ private:
     std::uint64_t nextMediaGeneration_{1};
     std::atomic<std::uint64_t> boundMediaGeneration_{};
     std::uint32_t requiredPrebufferFrames_{};
-    std::wstring nativeEndpoint_;
+    std::wstring selectedEndpoint_;
     std::wstring asioDriverClsid_;
     std::uint64_t selectionArmItem_{};
     ULONGLONG nextTelemetryTick_{};

@@ -3,6 +3,7 @@
 #include "LosslessQualityPolicy.h"
 #include "IpcProtocol.h"
 #include "IpcTransport.h"
+#include "output_device/SelectedEndpoint.h"
 
 #include <windows.h>
 #include <appmodel.h>
@@ -98,6 +99,11 @@ std::atomic<bool> g_shutdown{};
 std::atomic<std::uint64_t> g_lastErrorDialogSignature{};
 std::vector<Client> g_clients;
 HANDLE g_authoritativeAgentPipe{INVALID_HANDLE_VALUE};
+ammod::output_device::OutputSelection g_appliedOutput;
+ammod::output_device::SelectedEndpointStore& OutputStore() {
+    static ammod::output_device::SelectedEndpointStore store;
+    return store;
+}
 Message g_status = [] {
     auto message = NewMessage(MessageType::StatusChanged, Role::Broker);
     message.state = RuntimeState::Off;
@@ -873,7 +879,7 @@ void HandleMessage(const Message& incoming, HANDLE source) {
     Message status{};
     bool showError = false;
     {
-        std::lock_guard lock(g_mutex);
+        std::unique_lock lock(g_mutex);
         if (std::none_of(g_clients.begin(), g_clients.end(), [&](const Client& client) {
                 return client.pipe == source && client.role == incoming.role && client.pid == incoming.senderPid;
             })) return;
@@ -881,9 +887,22 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         if (incoming.role == Role::Agent &&
             (source != g_authoritativeAgentPipe || incoming.minor < 2 ||
              !IsEqualGUID(incoming.requestId, intentToken))) return;
-        if (incoming.type == MessageType::SetEnabled) {
+        const bool outputChanged = incoming.type == MessageType::OutputSelectionChanged ||
+                                   incoming.type == MessageType::SetEnabled;
+        if (outputChanged) {
             if (incoming.role != Role::Ui && incoming.role != Role::Controller) return;
-            const bool newIntent = incoming.enabledIntent != 0;
+            if (incoming.type == MessageType::SetEnabled &&
+                !OutputStore().SetExclusive(incoming.enabledIntent != 0)) return;
+            const auto selected = OutputStore().Read();
+            if (!selected) return;
+            if (*selected == g_appliedOutput) {
+                status = g_status;
+                lock.unlock();
+                WriteMessage(source, status);
+                return;
+            }
+            g_appliedOutput = *selected;
+            const bool newIntent = selected->exclusive;
             g_status.generation++;
             g_status.enabledIntent = newIntent ? 1 : 0;
             if (newIntent) {
@@ -994,12 +1013,12 @@ void HandleMessage(const Message& incoming, HANDLE source) {
         } else {
             return;
         }
-        if (incoming.type == MessageType::SetEnabled) {
-            WritePrivateProfileStringW(L"mod", L"mode",
-                g_status.enabledIntent ? L"exclusive" : L"probe", BrokerIniPath().c_str());
-        }
+        // Agent telemetry describes the active hardware. All peers receive the
+        // same user-selected endpoint and mode, even after a fallback or pause.
+        wcscpy_s(g_status.endpointId, g_appliedOutput.endpoint.c_str());
+        g_status.minor = kProtocolMinor;
         g_status.requestId = intentToken;
-        if (incoming.type == MessageType::SetEnabled) CoCreateGuid(&g_status.requestId);
+        if (outputChanged) CoCreateGuid(&g_status.requestId);
         if (!g_status.enabledIntent) {
             g_status.state = RuntimeState::Off;
             g_status.error = ErrorCategory::None;
@@ -1023,7 +1042,6 @@ void SelectAgentLocked(HANDLE pipe, DWORD pid) {
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
     g_status.error = ErrorCategory::None;
     g_status.hresult = S_OK;
-    g_status.endpointId[0] = 0;
     g_status.endpointName[0] = 0;
     g_status.format[0] = 0;
     g_status.detail[0] = 0;
@@ -1054,7 +1072,7 @@ void ClientThread(HANDLE pipe) {
         CloseHandle(pipe);
         return;
     }
-    if (hello.role == Role::Agent && hello.minor < 3) {
+    if (hello.role == Role::Agent && hello.minor < 4) {
         ReportComponentFailure(ErrorCategory::ProtocolVersionMismatch,
                                HRESULT_FROM_WIN32(ERROR_REVISION_MISMATCH), true);
         DisconnectNamedPipe(pipe);
@@ -1135,19 +1153,22 @@ int wmain() {
         CloseHandle(instanceMutex);
         return 0;
     }
-    wchar_t savedMode[32]{};
-    GetPrivateProfileStringW(L"mod", L"mode", L"probe", savedMode,
-        static_cast<DWORD>(std::size(savedMode)), BrokerIniPath().c_str());
-    g_status.enabledIntent = _wcsicmp(savedMode, L"exclusive") == 0 ? 1 : 0;
+    const auto selected = OutputStore().Read();
+    if (!selected) {
+        Log(L"could not read the saved output selection");
+        CloseHandle(instanceMutex);
+        return 2;
+    }
+    g_appliedOutput = *selected;
+    wcscpy_s(g_status.endpointId, selected->endpoint.c_str());
+    g_status.enabledIntent = selected->exclusive ? 1 : 0;
     g_status.hardwareBufferMs = ReadHardwareBufferMs();
     g_status.allowResampling = ReadAllowResampling() ? 1 : 0;
     g_status.maxSourceSampleRate = ReadSourceSampleRateLimit();
     g_status.state = g_status.enabledIntent ? RuntimeState::WaitingForStream : RuntimeState::Off;
-    // output-device-selector: exclusive intent must not survive a broker restart; kept as an override so the upstream lines above stay untouched.
-    g_status.enabledIntent = 0;
-    g_status.state = RuntimeState::Off;
     Log(L"companion started pid=" + std::to_wstring(GetCurrentProcessId()) +
         L" persistedIntent=" + std::to_wstring(g_status.enabledIntent) +
+        L" selectedOutput=" + (selected->endpoint.empty() ? L"<default>" : selected->endpoint) +
         L" hardwareBufferMs=" + std::to_wstring(g_status.hardwareBufferMs) +
         L" allowResampling=" + std::to_wstring(g_status.allowResampling));
     const auto pipeName = PipeName();

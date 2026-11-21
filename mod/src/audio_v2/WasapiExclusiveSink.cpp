@@ -91,10 +91,19 @@ HRESULT WasapiExclusiveSink::Open(const WasapiSinkConfig& config) noexcept {
                                   __uuidof(IMMDeviceEnumerator),
                                   reinterpret_cast<void**>(&enumerator_));
     if (SUCCEEDED(hr)) {
-        if (config_.endpointId.empty()) {
-            hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
-        } else {
+        if (!config_.endpointId.empty()) {
             hr = enumerator_->GetDevice(config_.endpointId.c_str(), &device_);
+            if (SUCCEEDED(hr) && config_.useDefaultIfUnavailable) {
+                DWORD state{};
+                hr = device_->GetState(&state);
+                if (SUCCEEDED(hr) && !(state & DEVICE_STATE_ACTIVE))
+                    hr = AUDCLNT_E_DEVICE_INVALIDATED;
+            }
+        }
+        if (config_.endpointId.empty() || (FAILED(hr) && config_.useDefaultIfUnavailable)) {
+            Release(device_);
+            ScopedNativeProxyBypass bypass;
+            hr = enumerator_->GetDefaultAudioEndpoint(eRender, eConsole, &device_);
         }
     }
     if (SUCCEEDED(hr)) hr = ActivateClient();
