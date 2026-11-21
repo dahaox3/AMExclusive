@@ -9,6 +9,7 @@
 !/mod/tests/README.md
 !/mod/tests/RegressionTests.cpp
 !/mod/tests/PlaybackLifecycleTests.cpp
+!/mod/tests/AsioOutputTests.cpp
 !/mod/tests/InstallerIdentity.Tests.ps1
 !/mod/tests/QualityAbiProbe.cpp
 !/mod/tests/SourceSelectionProbe.cpp

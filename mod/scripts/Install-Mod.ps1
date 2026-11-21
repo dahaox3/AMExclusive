@@ -174,6 +174,7 @@ $preservedMode = $null
 $preservedPeriod100ns = $null
 $preservedAllowResampling = $null
 $preservedSourceSampleRate = $null
+$preservedAsioDriver = $null
 foreach ($existingIni in @(
     (Join-Path $install 'am-exclusive.ini')
 )) {
@@ -187,6 +188,12 @@ foreach ($existingIni in @(
         }
         if ($line -match '^\s*max_source_sample_rate\s*=\s*(48000|96000|192000)\s*$') {
             $preservedSourceSampleRate = [int]$Matches[1]
+        }
+        if ($line -match '^\s*asio_driver\s*=\s*(\{[0-9a-fA-F-]{36}\})\s*$') {
+            $parsedDriver = [Guid]::Empty
+            if ([Guid]::TryParseExact($Matches[1], 'B', [ref]$parsedDriver)) {
+                $preservedAsioDriver = $parsedDriver.ToString('B').ToUpperInvariant()
+            }
         }
         if ($line -match '^\s*period_100ns\s*=\s*(\d+)\s*$') {
             [uint64]$candidatePeriod = 0
@@ -250,6 +257,13 @@ if ($null -ne $preservedSourceSampleRate) {
     $iniText = [IO.File]::ReadAllText($iniPath)
     $iniText = [Text.RegularExpressions.Regex]::Replace(
         $iniText, '(?m)^\s*max_source_sample_rate\s*=.*$', "max_source_sample_rate=$preservedSourceSampleRate")
+    [IO.File]::WriteAllText($iniPath, $iniText, (New-Object Text.UTF8Encoding($false)))
+}
+if ($preservedAsioDriver) {
+    $iniPath = Join-Path $install 'am-exclusive.ini'
+    $iniText = [IO.File]::ReadAllText($iniPath)
+    $iniText = [Text.RegularExpressions.Regex]::Replace(
+        $iniText, '(?m)^asio_driver=.*$', "asio_driver=$preservedAsioDriver")
     [IO.File]::WriteAllText($iniPath, $iniText, (New-Object Text.UTF8Encoding($false)))
 }
 # Only this file is intentionally transformed to preserve the user's settings.

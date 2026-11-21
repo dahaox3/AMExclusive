@@ -1,4 +1,10 @@
-# WASAPI drain hardware regression probe
+# Audio output tests
+
+`asio_output` uses an in-memory driver in CTest. It checks channel packing, partial periods, clock and latency notifications, buffer-size changes, busy starts, and callback ordering. The `playback_lifecycle` suite also checks manual selection and the captured tail when a streaming decoder disappears before its final callback.
+
+For a physical Windows ASIO driver, `am_exclusive_asio_tests.exe --inspect <CLSID>` reports its current clock and timing. With the device idle, `am_exclusive_asio_tests.exe --silence <CLSID> <sample-rate>` opens, submits silence, drains, releases and reacquires it twice. This can change the hardware clock. Record the initial rate and restore it after the test.
+
+## WASAPI drain hardware regression probe
 
 ## Fork regression checks
 

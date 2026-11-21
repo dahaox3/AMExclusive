@@ -1,4 +1,5 @@
 #include "AudioCoreCoordinator.h"
+#include "../AudioErrors.h"
 
 #include <new>
 
@@ -44,6 +45,7 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
     }
 
     config_ = config;
+    SelectConfiguredSink();
     sourceFormat_ = config.sink.format;
     config_.sink.sourceReadyEvent = sourceReadyEvent_;
     token_ = *token;
@@ -62,7 +64,7 @@ HRESULT AudioCoreCoordinator::Enable(const AudioCoreCoordinatorConfig& config) n
 
 void AudioCoreCoordinator::Disable() noexcept {
     if (!gate_.UiEnabled() && !queue_ && !source_ && !sourceReadyEvent_ &&
-        sink_.State() == WasapiSinkState::Closed) {
+        Output().State() == WasapiSinkState::Closed) {
         return;
     }
 
@@ -72,8 +74,8 @@ void AudioCoreCoordinator::Disable() noexcept {
     outputGate_.Reset();
     gate_.SetUiEnabled(false);
     if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
-    sink_.Stop();
-    sink_.Close();
+    Output().Stop();
+    Output().Close();
     endpointReleased_ = false;
     resumeConfig_ = {};
     resampledSource_.Reset();
@@ -94,7 +96,7 @@ bool AudioCoreCoordinator::PushResult(bool pushed, std::uint32_t frames) noexcep
         // The producer notification exists only to restart a sink that had to
         // stop for source starvation. Signaling it for every healthy P0 block
         // needlessly wakes the real-time render thread at producer cadence.
-        if (sourceReadyEvent_ && sink_.WaitingForSource()) SetEvent(sourceReadyEvent_);
+        if (sourceReadyEvent_ && Output().WaitingForSource()) SetEvent(sourceReadyEvent_);
     } else {
         droppedFrames_.fetch_add(frames, std::memory_order_relaxed);
         gate_.Fail(token_);
@@ -137,20 +139,22 @@ HRESULT AudioCoreCoordinator::OpenEndpoint() noexcept {
     if (!queue_ || !source_ || !gate_.CanOpenEndpoint(token_)) return E_UNEXPECTED;
     if (queue_->Size() == 0) return E_PENDING;
 
-    HRESULT hr = sink_.Open(config_.sink);
+    HRESULT hr = Output().Open(config_.sink);
+    if (UsesAsio() && hr == AUDCLNT_E_UNSUPPORTED_FORMAT)
+        hr = config_.sink.allowResampling ? audio::kExclusiveFormatUnavailable : audio::kBitPerfectFormatUnavailable;
     if (SUCCEEDED(hr) && IsConverting()) {
-        hr = resampledSource_.Configure(*source_, sourceFormat_, sink_.Format(),
-                                         sink_.BufferFrames());
+        hr = resampledSource_.Configure(*source_, sourceFormat_, Output().Format(),
+                                         Output().BufferFrames());
     }
     if (FAILED(hr)) {
-        sink_.Close();
+        Output().Close();
         resampledSource_.Reset();
         outputGate_.Reset();
         gate_.Fail(token_);
         return hr;
     }
     if (!gate_.MarkPrebuffered(token_)) {
-        sink_.Close();
+        Output().Close();
         outputGate_.Reset();
         gate_.Fail(token_);
         return E_UNEXPECTED;
@@ -163,63 +167,93 @@ HRESULT AudioCoreCoordinator::Start() noexcept {
         gate_.Phase() != AudioCoreGatePhase::Prebuffered) {
         return E_UNEXPECTED;
     }
-    const HRESULT hr = sink_.Start(ActiveSource());
+    const HRESULT hr = Output().Start(ActiveSource());
     if (FAILED(hr)) {
         outputGate_.Reset();
-        sink_.Close();
+        Output().Close();
         gate_.Fail(token_);
         return hr;
     }
     if (!outputGate_.CommitCutover(token_)) {
-        sink_.Stop();
-        sink_.Close();
+        Output().Stop();
+        Output().Close();
         outputGate_.Rollback(token_);
         return E_UNEXPECTED;
     }
     return S_OK;
 }
 
+void AudioCoreCoordinator::SelectConfiguredSink() noexcept {
+    sink_.store(config_.sink.asioDriverClsid.empty() ? static_cast<IPlaybackSink*>(&wasapi_)
+                                                     : static_cast<IPlaybackSink*>(&asio_));
+}
+
+void AudioCoreCoordinator::SetAsioDriver(std::wstring_view clsid) {
+    if (config_.sink.asioDriverClsid == clsid) return;
+    config_.sink.asioDriverClsid.assign(clsid);
+    if (endpointReleased_) resumeConfig_.asioDriverClsid.assign(clsid);
+    // An active backend keeps its callback ownership through Stop/Close.
+    if (Output().State() == WasapiSinkState::Closed) SelectConfiguredSink();
+}
+
 void AudioCoreCoordinator::PauseEndpoint() noexcept {
     if (gate_.Phase() == AudioCoreGatePhase::Active &&
-        !endpointReleased_ && sink_.State() != WasapiSinkState::Closed) {
+        !endpointReleased_ && Output().State() != WasapiSinkState::Closed) {
         resumeConfig_ = config_.sink;
-        resumeFormat_ = sink_.Format();
-        resumeBufferFrames_ = sink_.BufferFrames();
+        resumeFormat_ = Output().Format();
         // Re-query the selected/default route on resume: a video application
         // may have changed the Windows endpoint while music was paused.
         if (config_.followDefaultEndpointOnResume) resumeConfig_.endpointId.clear();
         resumeConfig_.primeWithSilence = true;
-        (void)sink_.DrainAndClose();
+        (void)Output().DrainAndClose();
+        SelectConfiguredSink();
         endpointReleased_ = true;
     }
 }
 
 HRESULT AudioCoreCoordinator::ResumeEndpoint() noexcept {
     if (!source_ || gate_.Phase() != AudioCoreGatePhase::Active) return E_UNEXPECTED;
-    if (sink_.State() == WasapiSinkState::Running) return S_OK;
+    if (Output().State() == WasapiSinkState::Running) return S_OK;
     if (endpointReleased_) {
-        const HRESULT open = sink_.Open(resumeConfig_);
+        const HRESULT open = Output().Open(resumeConfig_);
+        if (UsesAsio() && open == AUDCLNT_E_UNSUPPORTED_FORMAT)
+            return resumeConfig_.allowResampling ? audio::kExclusiveFormatUnavailable : audio::kBitPerfectFormatUnavailable;
         if (FAILED(open)) return open;
         const auto& expected = resumeFormat_;
-        const auto& actual = sink_.Format();
+        const auto& actual = Output().Format();
         // Converter lookahead belongs to the existing output format. Keep it
         // intact across pause; never silently reconfigure/drop staged samples.
-        if (actual.sampleRate != expected.sampleRate || actual.channels != expected.channels ||
-            actual.validBits != expected.validBits || actual.containerBits != expected.containerBits ||
-            actual.encoding != expected.encoding || sink_.BufferFrames() > resumeBufferFrames_) {
-            sink_.Close();
-            return AUDCLNT_E_UNSUPPORTED_FORMAT;
+        const bool wasConverted = RequiresPcmConversion(sourceFormat_, expected);
+        const bool needsConversion = IsConverting();
+        const bool sameConversion = wasConverted && needsConversion &&
+            actual.sampleRate == expected.sampleRate && actual.validBits == expected.validBits &&
+            actual.encoding == expected.encoding;
+        if (sameConversion) {
+            const auto hr = resampledSource_.ReserveOutputFrames(Output().BufferFrames());
+            if (FAILED(hr)) { Output().Close(); return hr; }
+        } else if (wasConverted || needsConversion) {
+            if (resampledSource_.PendingSourceFrames()) {
+                Output().Close();
+                return audio::kExclusiveFormatUnavailable;
+            }
+            resampledSource_.Reset();
+            if (needsConversion) {
+                const auto hr = resampledSource_.Configure(*source_, sourceFormat_, actual, Output().BufferFrames());
+                if (FAILED(hr)) { Output().Close(); return hr; }
+            }
+            // A transient Start failure can retry this exact prepared layout.
+            resumeFormat_ = actual;
         }
-        const HRESULT start = sink_.Start(ActiveSource());
+        const HRESULT start = Output().Start(ActiveSource());
         if (FAILED(start)) {
-            sink_.Close();
+            Output().Close();
             return start;
         }
         endpointReleased_ = false;
         return S_OK;
     }
-    if (sink_.State() != WasapiSinkState::Open) return E_UNEXPECTED;
-    return sink_.Start(ActiveSource());
+    if (Output().State() != WasapiSinkState::Open) return E_UNEXPECTED;
+    return Output().Start(ActiveSource());
 }
 
 IIntegerPcmSource& AudioCoreCoordinator::ActiveSource() noexcept {

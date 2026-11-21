@@ -2,6 +2,7 @@
 #include "audio_v2/NativeRenderGateProxy.h"
 #include "output_device/OutputDeviceLog.h"
 #include "output_device/SelectedEndpoint.h"
+#include "output_device/AsioDevices.h"
 
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -46,7 +47,7 @@ HRESULT STDMETHODCALLTYPE RedirectGetDefaultAudioEndpoint(IMMDeviceEnumerator* s
         return result;
     }
     const auto selected = Store().Read();
-    if (selected.empty()) return result;
+    if (selected.empty() || IsAsioRoute(selected)) return result;
     if (auto* redirected = OpenActiveRenderEndpoint(self, selected)) {
         (*device)->Release();
         *device = redirected;

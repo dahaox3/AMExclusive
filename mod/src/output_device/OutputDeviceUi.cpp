@@ -3,6 +3,7 @@
 #include "LosslessQualityPolicy.h"
 #include "output_device/OutputDeviceLog.h"
 #include "output_device/SelectedEndpoint.h"
+#include "output_device/AsioDevices.h"
 
 #include <windows.h>
 #include <mmdeviceapi.h>
@@ -250,6 +251,12 @@ void RebuildOutputDeviceMenu(const Controls::MenuFlyout& flyout) {
     for (const auto& endpoint : endpoints) {
         items.Append(MakeOutputDeviceItem(Localized(L"[独占] ", L"[Exclusive] ") + endpoint.name,
                                           endpoint.id, true, selected, currentlyExclusive, enabled));
+    }
+    const auto asioDrivers = EnumerateAsioDevices();
+    if (!asioDrivers.empty()) items.Append(Controls::MenuFlyoutSeparator());
+    for (const auto& driver : asioDrivers) {
+        items.Append(MakeOutputDeviceItem(L"[ASIO] " + driver.name,
+            std::wstring(kAsioPrefix) + driver.clsid, true, selected, currentlyExclusive, enabled));
     }
     items.Append(Controls::MenuFlyoutSeparator());
     Controls::MenuFlyoutItem heading;

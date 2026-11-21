@@ -135,7 +135,10 @@ constexpr bool IsValidEndpointFormat(const PcmFormat& format,
         if (!allowConversion || format.validBits != 32 || format.containerBits != 32) return false;
         layout.encoding = PcmEncoding::SignedInteger;
     }
-    layout.sourceValidBits = format.validBits;
+    // ASIO also defines right-aligned 18/20-bit samples in a 32-bit slot.
+    if (format.containerBits == 32 && (format.validBits == 18 || format.validBits == 20))
+        layout.validBits = 24;
+    layout.sourceValidBits = layout.validBits;
     return IsValidFormat(layout) &&
         IsSupportedSourceDepth(EffectiveSourceValidBits(format)) &&
         (allowConversion || EffectiveSourceValidBits(format) <= format.validBits);

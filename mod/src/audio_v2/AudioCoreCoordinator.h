@@ -7,6 +7,7 @@
 #include "QueuedPcmSource.h"
 #include "ResampledPcmSource.h"
 #include "WasapiExclusiveSink.h"
+#include "AsioExclusiveSink.h"
 
 #include <atomic>
 #include <cstddef>
@@ -66,6 +67,7 @@ public:
     HRESULT Start() noexcept;
     void PauseEndpoint() noexcept;
     HRESULT ResumeEndpoint() noexcept;
+    void SetAsioDriver(std::wstring_view clsid);
     bool EndpointReleased() const noexcept { return endpointReleased_; }
 
     bool ShouldSuppressNative() const noexcept;
@@ -73,29 +75,30 @@ public:
     AudioCoreGatePhase Phase() const noexcept { return gate_.Phase(); }
     // Requested output until the endpoint opens, then its negotiated format.
     const PcmFormat& OutputFormat() const noexcept {
-        return sink_.State() == WasapiSinkState::Closed ? config_.sink.format : sink_.Format();
+        return Output().State() == WasapiSinkState::Closed ? config_.sink.format : Output().Format();
     }
     const PcmFormat& SourceFormat() const noexcept { return sourceFormat_; }
     bool IsSourceMappingExact() const noexcept {
         return config_.mappingPolicy == PcmMappingPolicy::ExactSourceInteger;
     }
     bool IsResampling() const noexcept {
-        return sink_.State() != WasapiSinkState::Closed &&
-               sink_.Format().sampleRate != sourceFormat_.sampleRate;
+        return Output().State() != WasapiSinkState::Closed &&
+               Output().Format().sampleRate != sourceFormat_.sampleRate;
     }
     bool IsReducingBitDepth() const noexcept {
-        return sink_.State() != WasapiSinkState::Closed &&
-            sink_.Format().validBits < EffectiveSourceValidBits(sourceFormat_);
+        return Output().State() != WasapiSinkState::Closed &&
+            Output().Format().validBits < EffectiveSourceValidBits(sourceFormat_);
     }
     bool IsConverting() const noexcept {
-        return sink_.State() != WasapiSinkState::Closed &&
-            RequiresPcmConversion(sourceFormat_, sink_.Format());
+        return Output().State() != WasapiSinkState::Closed &&
+            RequiresPcmConversion(sourceFormat_, Output().Format());
     }
     std::uint64_t MediaGeneration() const noexcept { return config_.mediaGeneration; }
     const AudioCoreCoordinatorStats Stats() const noexcept;
-    const WasapiExclusiveSink& Sink() const noexcept { return sink_; }
-    WasapiSinkState SinkState() const noexcept { return sink_.State(); }
-    void SetSinkResumeBlocked(bool blocked) noexcept { sink_.SetResumeBlocked(blocked); }
+    const IPlaybackSink& Sink() const noexcept { return Output(); }
+    bool UsesAsio() const noexcept { return sink_.load() == &asio_; }
+    WasapiSinkState SinkState() const noexcept { return Output().State(); }
+    void SetSinkResumeBlocked(bool blocked) noexcept { Output().SetResumeBlocked(blocked); }
     std::size_t BufferedBlocks() const noexcept { return queue_ ? queue_->Size() : 0; }
     std::size_t BufferedFrames() const noexcept {
         return queue_ ? queue_->QueuedFrames() : 0;
@@ -111,9 +114,9 @@ public:
         // when the worker observes EOS. Always let it see the producer seal;
         // independent queue/staging snapshots cannot prove that it is empty.
         return PendingSourceFrames() != 0 ||
-            (sink_.State() != WasapiSinkState::Closed &&
-             (IsConverting() || sink_.Stats().submittedFrames != 0) &&
-             !sink_.EndOfStreamComplete());
+            (Output().State() != WasapiSinkState::Closed &&
+             (IsConverting() || Output().Stats().submittedFrames != 0) &&
+             !Output().EndOfStreamComplete());
     }
     bool SealEndOfStream() noexcept {
         if (!queue_) return false;
@@ -121,10 +124,11 @@ public:
         if (sourceReadyEvent_) SetEvent(sourceReadyEvent_);
         return true;
     }
-    bool EndOfStreamSubmitted() const noexcept { return sink_.EndOfStreamSubmitted(); }
-    bool EndOfStreamComplete() const noexcept { return sink_.EndOfStreamComplete(); }
+    bool EndOfStreamSubmitted() const noexcept { return Output().EndOfStreamSubmitted(); }
+    bool EndOfStreamComplete() const noexcept { return Output().EndOfStreamComplete(); }
 
 private:
+    friend struct AudioCoreRuntimeRegression;
     bool PushResult(bool pushed, std::uint32_t frames) noexcept;
     IIntegerPcmSource& ActiveSource() noexcept;
 
@@ -137,11 +141,14 @@ private:
     std::optional<QueuedPcmSource> source_;
     ResampledPcmSource resampledSource_;
     BitPerfectVerifier verifier_{};
-    WasapiExclusiveSink sink_{};
+    void SelectConfiguredSink() noexcept;
+    IPlaybackSink& Output() const noexcept { return *sink_.load(std::memory_order_acquire); }
+    WasapiExclusiveSink wasapi_{};
+    AsioExclusiveSink asio_{};
+    std::atomic<IPlaybackSink*> sink_{&wasapi_};
     HANDLE sourceReadyEvent_{};
     WasapiSinkConfig resumeConfig_{};
     PcmFormat resumeFormat_{};
-    std::uint32_t resumeBufferFrames_{};
     bool endpointReleased_{};
     std::uint64_t nextSequence_{};
     std::atomic<std::uint64_t> capturedFrames_{};

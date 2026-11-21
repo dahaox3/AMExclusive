@@ -105,6 +105,17 @@ HRESULT ResampledPcmSource::Configure(QueuedPcmSource& source,
     return S_OK;
 }
 
+HRESULT ResampledPcmSource::ReserveOutputFrames(std::uint32_t frames) noexcept {
+    if (!source_ || !frames || frames > kMaximumOutputFrames) return E_INVALIDARG;
+    if (frames <= maxOutputFrames_) return S_OK;
+    // Called while the device is closed. Retain staged output, FIR history,
+    // fractional phase and dither state across an ASIO period change.
+    try { staged_.resize(static_cast<std::size_t>(frames) * kSupportedChannels); }
+    catch (...) { return E_OUTOFMEMORY; }
+    maxOutputFrames_ = frames;
+    return S_OK;
+}
+
 void ResampledPcmSource::Reset() noexcept {
     source_ = nullptr;
     input_ = {};

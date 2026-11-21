@@ -1,5 +1,6 @@
 #include "audio_v2/AudioCoreRuntime.h"
 #include "SettingsRestartPolicy.h"
+#include "TrackSelectionGesture.h"
 #include <cstdio>
 #include <cstdlib>
 
@@ -244,7 +245,110 @@ struct AudioCoreRuntimeRegression {
                   "seek cancels prefetched identity and PCM from the old timeline");
         }
     }
+    static void ManualAndDisposeCases() {
+        const auto decoder = reinterpret_cast<void*>(0x1010);
+        const auto future = reinterpret_cast<void*>(0x4050);
+        const auto start = [&](AudioCoreRuntime& r) {
+            Register(r, decoder); Bind(r, decoder);
+            r.OnAudioUnitStarted(r.graphUnit_);
+            r.nativeStarted_ = true;
+            Pcm(r, decoder, 96000);
+            auto& c = r.coordinator_;
+            Check(c.gate_.MarkPrebuffered(c.token_) && c.outputGate_.CommitCutover(c.token_),
+                  "fixture commits gate with captured stereo PCM");
+            r.OnTransportPlaybackState(5, true, 100);
+        };
+        {
+            AudioCoreRuntime r; start(r);
+            r.OnTransportSelectionArm(6);
+            Register(r, future, 48000);
+            const auto nextUnit = reinterpret_cast<void*>(0x9010);
+            r.OnAudioUnitInitialized(nextUnit, future, 48000, 2, 24, 1);
+            r.OnAudioUnitStarted(nextUnit);
+            r.OnConverterDisposed(future);
+            Check(r.BoundConverter() == decoder && !r.endOfStreamDrainPending_,
+                  "row highlight and canceled prefetch leave the playing item intact");
+            r.OnAudioUnitStopped(r.graphUnit_);
+            Check(r.streamingProducerDrainPending_, "owning stop awaits final producer callback");
+            r.OnConverterDisposed(decoder);
+            Check(r.endOfStreamDrainPending_ && r.endOfStreamDrainRegistration_ &&
+                  !r.streamingProducerDrainPending_, "early dispose seals the real stream before unregistering");
+            auto& src = *r.coordinator_.source_;
+            std::int32_t samples[8]{}; std::uint32_t n{}; bool eof{};
+            Check(src.Prepare(4) == S_OK && src.Fill(samples, 4, n, eof) == S_OK && n == 2 && eof &&
+                  samples[0] == 0x20000000 && samples[1] == -0x20000000 &&
+                  samples[2] == 0x40000000 && samples[3] == -0x40000000,
+                  "both original stereo frames survive early decoder disposal");
+            Register(r, decoder);
+            r.endOfStreamDrainRemainingMs_ = 0;
+            r.FinalizeEndOfStreamDrainLocked();
+            Check(!r.graphBound_, "early dispose cannot revive a new decoder at the same address");
+        }
+        {
+            AudioCoreRuntime r; start(r);
+            r.OnAudioUnitStopped(r.graphUnit_);
+            r.OnTransportPlaybackState(6, false, 100);
+            r.OnConverterDisposed(decoder);
+            r.endOfStreamDrainRemainingMs_ = 0;
+            r.FinalizeEndOfStreamDrainLocked();
+            Check(r.endOfStreamDrainPending_ && r.coordinator_.PendingSourceFrames() == 2,
+                  "pause between scheduler Stop and Dispose retains the sealed tail");
+        }
+        {
+            AudioCoreRuntime r; start(r);
+            r.OnStreamingProducerEndOfStream(decoder);
+            r.OnConverterDisposed(decoder);
+            r.OnAudioUnitStopped(r.graphUnit_);
+            Check(r.endOfStreamDrainPending_ && r.coordinator_.PendingSourceFrames() == 2,
+                  "a final zero-packet Fill plus Dispose also seals before a late scheduler Stop");
+        }
+        for (bool itemFirst : {false, true}) {
+            AudioCoreRuntime r; start(r);
+            r.OnTransportSelectionArm(6);
+            if (itemFirst) r.OnTransportPlaybackState(7, true, 200);
+            r.OnAudioUnitStopped(r.graphUnit_);
+            if (!itemFirst) r.OnTransportPlaybackState(7, true, 200);
+            Check(!r.graphBound_ && !r.endOfStreamDrainPending_, "single click plus item/Stop in either order skips old media");
+        }
+        {
+            AudioCoreRuntime r; start(r);
+            r.OnTransportSelectionArm(6);
+            r.directSelectionArmDeadlineTick_.store(GetTickCount64() - 1);
+            r.OnTransportPlaybackState(7, true, 200);
+            r.OnAudioUnitStopped(r.graphUnit_);
+            Check(r.streamingProducerDrainPending_, "expired click cannot discard a later natural tail");
+        }
+        {
+            AudioCoreRuntime r; start(r);
+            r.OnTransportPlaybackState(6, false, 100);
+            r.OnTransportSelectionArm(7);
+            Check(r.userPauseIntent_, "highlight alone never revokes the player's explicit pause");
+        }
+        {
+            AudioCoreRuntime r; start(r);
+            auto& c = r.coordinator_;
+            auto format = c.SourceFormat();
+            format.validBits = format.containerBits = 16;
+            format.sourceValidBits = 24;
+            ResampledPcmSource converted;
+            Check(converted.Configure(*c.source_, c.SourceFormat(), format, 4) == S_OK,
+                  "configure depth conversion");
+            Check(converted.Prepare(4) == kAudioSourceWouldBlock && converted.PendingSourceFrames() == 2,
+                  "partial source is staged before changing buffer size");
+            Check(converted.ReserveOutputFrames(16) == S_OK, "grow buffer without resetting the converter");
+            c.SealEndOfStream();
+            std::int32_t data[32]{}; std::uint32_t n{}; bool eof{};
+            Check(converted.Prepare(16) == S_OK && converted.Fill(data, 16, n, eof) == S_OK &&
+                  n == 2 && eof && data[0] > 0 && data[1] < 0, "new period retains staged stereo tail");
+        }
+        Check(ammod::ui::IsRowPlayButton(L"PlayTrackButton", L"", L"") &&
+              ammod::ui::IsRowPlayButton(L"", L"", L"播放") &&
+              !ammod::ui::IsRowPlayButton(L"MoreButton", L"", L"More") &&
+              !ammod::ui::IsRowPlayButton(L"Heart", L"", L"Add to Playlist"), "only play controls confirm a row click");
+    }
+
     static void Run() {
+        ManualAndDisposeCases();
         PredecodeCases();
         const auto decoder = reinterpret_cast<void*>(0x1000);
         {

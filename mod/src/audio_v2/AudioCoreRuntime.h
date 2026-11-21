@@ -111,7 +111,7 @@ struct AudioCoreRuntimeEventSnapshot final {
     std::uint64_t mediaGeneration{};
     void* converter{};
     PcmFormat outputFormat{}, sourceFormat{};
-    bool resampled{}, reducingBitDepth{}, sourceMappingExact{}, converting{};
+    bool resampled{}, reducingBitDepth{}, sourceMappingExact{}, converting{}, asio{};
     AudioCoreRuntimeStats stats{};
 };
 
@@ -137,6 +137,7 @@ public:
     void SetUiEnabled(bool enabled) noexcept;
     void SetHardwareBufferMilliseconds(std::uint32_t milliseconds) noexcept;
     void SetAllowResampling(bool enabled) noexcept;
+    void SetAsioDriver(std::wstring_view clsid);
     bool UiEnabled() const noexcept { return uiEnabled_.load(std::memory_order_acquire); }
 
     // UI transport intents are control-plane only. They gate when the exact
@@ -290,8 +291,10 @@ private:
     void TryActivateLocked() noexcept;
     void TryResumePausedSinkLocked(bool requireFreshProducer = false) noexcept;
     void ExtendSeekQuietPeriodLocked() noexcept;
+    bool DirectSelectionArmed() const noexcept;
     bool DirectSelectionPending() const noexcept;
-    bool RetireDirectSelectionLocked() noexcept;
+    bool ManualOwningStopLocked() const noexcept;
+    bool RetireDirectSelectionLocked(bool owningStop = false) noexcept;
     bool BeginEndOfStreamDrainLocked(void* converter, bool requireShortTail) noexcept;
     void FinalizeEndOfStreamDrainLocked() noexcept;
     void RetireCompletedCaptureLocked(void* converter) noexcept;
@@ -413,6 +416,8 @@ private:
     std::atomic<std::uint64_t> boundMediaGeneration_{};
     std::uint32_t requiredPrebufferFrames_{};
     std::wstring nativeEndpoint_;
+    std::wstring asioDriverClsid_;
+    std::uint64_t selectionArmItem_{};
     ULONGLONG nextTelemetryTick_{};
     ULONGLONG nextEndpointRetryTick_{};
     // Read-only classifier snapshots continue while the UI switch is Off.

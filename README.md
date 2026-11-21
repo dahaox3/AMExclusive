@@ -4,6 +4,10 @@
 
 # AMExclusive
 
+**0.3.4 adds ASIO output, manual track selection and a streaming tail fix.** Choose the installed x64 driver under **Output device → [ASIO]**. Each song opens the driver at the selected Apple source rate. The driver supplies the channel format, preferred buffer size and output latency each time it opens. Pause frees the driver for other apps. A driver reset or buffer-size change during playback triggers renegotiation. The default Apple lossless source ceiling is 96 kHz. Local rate conversion remains opt-in.
+
+Row Play, double-click and a queue-item change after a single click identify manual selection. A natural streaming stop followed by early decoder disposal drains already captured PCM through the output before handing off to the next song.
+
 **0.3.3 — Protect the playing song from next-track predecode.** A successor's early AudioUnit initialization or Start now keeps the current decoder, output identity and PCM queue intact. Its bounded PCM reservoir is promoted after natural retirement; explicit selection requires the selected graph's initialization/Start instead of assuming the prefetched song is the target. Canceled or replaced decoder registrations are discarded. Inspired by Orion's active-graph deferral, adapted to this fork's pause/release and transport fences. Hardware-free production-runtime regressions cover natural handoff, parent-only Start, sample-rate changes, prefetch backpressure, cancellation, late source precision, pause, seek and both Next event orderings. Actual Apple Music/device playback remains a post-install acceptance check.
 
 **0.3.2 — Restore player-state observation on Apple Music 1.7.** Ports upstream 1.8's modern/legacy IPlayer and INowPlayingItem probing. The previous observer failed with E_NOINTERFACE, leaving stale pause intent that could prevent a newly bound song from activating. Modern observer attachment verified on package 1.1792.39942.0. The 96 kHz source policy remains intact; other upstream 1.8 changes are not included.

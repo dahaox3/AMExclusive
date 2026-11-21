@@ -19,6 +19,7 @@
 #include "LosslessQualityPolicy.h"
 #include "UiPlaybackState.h"
 #include "output_device/SelectedEndpoint.h"
+#include "output_device/AsioDevices.h"
 #include "audio_v2/AudioCoreGate.h"
 #include "audio_v2/AudioCoreRuntime.h"
 #include "audio_v2/NativeRenderGateProxy.h"
@@ -1848,7 +1849,8 @@ void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntim
             std::to_wstring(format.channels) + L" validBits=" +
             std::to_wstring(format.validBits) + L" containerBits=" +
             std::to_wstring(format.containerBits) + L" sourceBits=" +
-            std::to_wstring(sourceBits) + L" encoding=signed-int interleaved=1}");
+            std::to_wstring(sourceBits) + (format.encoding == ammod::audio_v2::PcmEncoding::IeeeFloat
+                ? L" encoding=float}" : L" encoding=signed-int}"));
         Log(L"audio core v2 active qpc=" + std::to_wstring(CurrentQpc()));
         const auto& sourceFormat = snapshot.sourceFormat;
         const bool resampled = snapshot.resampled;
@@ -1863,9 +1865,12 @@ void AudioCoreRuntimeEventCallback(void*, const ammod::audio_v2::AudioCoreRuntim
                  << (static_cast<double>(pcm.sampleRate) / 1000.0) << L" kHz";
             return text.str();
         };
-        const auto displayFormat = converted
-            ? describe(sourceFormat) + L" -> " + describe(format) : describe(format);
+        const bool showSource = converted || (snapshot.asio && sourceFormat.validBits != format.validBits);
+        const auto displayFormat = (snapshot.asio ? L"ASIO / " : L"") + (showSource
+            ? describe(sourceFormat) + L" -> " + describe(format) : describe(format));
         Log(L"audio core v2 output " + displayFormat +
+            (snapshot.asio ? L" driverPeriodFrames=" + std::to_wstring(snapshot.stats.sink.endpointPeriodFrames) +
+                L" driverOutputLatencyFrames=" + std::to_wstring(snapshot.stats.sink.outputLatencyFrames) : L"") +
             L" resampled=" + std::to_wstring(resampled) +
             L" depthReduced=" + std::to_wstring(depthReduced) +
             L" floatOutput=" + std::to_wstring(floatOutput) +
@@ -3624,13 +3629,16 @@ DWORD WINAPI PipeClientLoop(void*) {
                     (incoming.agentPid == 0 || incoming.agentPid == GetCurrentProcessId());
                 const auto hardwareBufferMs = incoming.hardwareBufferMs
                     ? incoming.hardwareBufferMs : 20u;
+                const auto endpoint = selectedEndpoint.Read();
+                const std::wstring_view route(endpoint);
+                g_audioCoreRuntime.SetAsioDriver(ammod::output_device::IsAsioRoute(route)
+                    ? route.substr(ammod::output_device::kAsioPrefix.size()) : std::wstring_view{});
                 g_audioCoreRuntime.SetHardwareBufferMilliseconds(hardwareBufferMs);
                 g_audioCoreRuntime.SetAllowResampling(incoming.allowResampling != 0);
                 g_ipcEnabled.store(enabled, std::memory_order_release);
                 if (!enabled) g_nativeP0Puller.DisableForUiOff();
                 g_audioCoreGate.SetUiEnabled(enabled);
                 g_audioCoreRuntime.SetUiEnabled(enabled);
-                const auto endpoint = selectedEndpoint.Read();
                 const bool owner = incoming.agentPid == GetCurrentProcessId();
                 if (!owner) cancelRestart();
                 const bool settingsChanged = haveAppliedSettings &&

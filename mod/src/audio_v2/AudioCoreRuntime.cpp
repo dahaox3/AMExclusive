@@ -22,6 +22,7 @@ constexpr std::uint32_t kReferenceTimePerSecond = 10000000u;
 // could mark the generation prebuffered. Keep enough bounded storage for the
 // observed cold-start burst without making the decoder callback wait.
 constexpr std::size_t kProductionQueueCapacity = 256;
+constexpr ULONGLONG kSelectionWindowMs = 2500;
 
 constexpr std::uint64_t NativePumpLowWaterFrames(std::uint32_t sampleRate) noexcept {
     return (static_cast<std::uint64_t>(sampleRate) * 3u) / 10u;
@@ -228,6 +229,13 @@ void AudioCoreRuntime::SetHardwareBufferMilliseconds(std::uint32_t milliseconds)
     hardwareBufferMs_.store(milliseconds, std::memory_order_release);
 }
 
+void AudioCoreRuntime::SetAsioDriver(std::wstring_view clsid) {
+    ControlScope lock(*this);
+    if (asioDriverClsid_ == clsid) return;
+    asioDriverClsid_.assign(clsid);
+    coordinator_.SetAsioDriver(clsid);
+}
+
 void AudioCoreRuntime::SetAllowResampling(bool enabled) noexcept {
     // Applied when the next generation is bound; never replace a live stream.
     allowResampling_.store(enabled, std::memory_order_release);
@@ -313,13 +321,15 @@ void AudioCoreRuntime::OnTransportPlaybackState(std::uint64_t revision, bool pla
             generation, std::memory_order_release);
         directSelectionArmEpoch_.store(revision, std::memory_order_release);
         directSelectionSkipEpoch_.store(revision, std::memory_order_release);
-        directSelectionArmDeadlineTick_.store(GetTickCount64() + 750,
+        directSelectionArmDeadlineTick_.store(GetTickCount64() + kSelectionWindowMs,
                                               std::memory_order_release);
         // The item notification can cross IPC after the old native Stop.
         if (!nativeStarted_ && !graphControlPending_ && !graphPaused_)
             (void)RetireDirectSelectionLocked();
     }
     userPauseIntent_ = false;
+    if (streamingProducerDrainPending_ && (!graphStarted_ || !nativeStarted_) && ManualOwningStopLocked())
+        (void)RetireDirectSelectionLocked(true);
     // A short same-item pause retains Apple's running native graph and emits
     // no new Start on Play. Request its resume here. Other item transitions
     // still need the owning native Start; TryResume checks graph/client state
@@ -334,12 +344,13 @@ void AudioCoreRuntime::OnTransportPlaybackState(std::uint64_t revision, bool pla
 void AudioCoreRuntime::OnTransportSelectionArm(std::uint64_t epoch) noexcept {
     if (!UiEnabled() || epoch == 0) return;
     ControlScope lock(*this);
+    selectionArmItem_ = playbackStateAvailable_ ? observedPlaybackItem_ : 0;
     directSelectionSkipEpoch_.store(0, std::memory_order_release);
     directSelectionArmGeneration_.store(
         boundMediaGeneration_.load(std::memory_order_acquire), std::memory_order_release);
     directSelectionArmEpoch_.store(epoch, std::memory_order_release);
-    directSelectionArmDeadlineTick_.store(GetTickCount64() + 750, std::memory_order_release);
-    if (userPauseIntent_) {
+    directSelectionArmDeadlineTick_.store(GetTickCount64() + kSelectionWindowMs, std::memory_order_release);
+    if (userPauseIntent_ && !playbackStateAvailable_) {
         userPauseIntent_ = false;
         // Native Start can arrive before this UI -> Broker -> Agent message.
         selectionAwaitingStart_ = !(nativeStartedAfterUserPause_ && nativeStarted_ && graphStarted_);
@@ -360,16 +371,18 @@ void AudioCoreRuntime::OnTransportSkipArm(std::uint64_t epoch) noexcept {
 
 void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
     if (!UiEnabled()) return;
-    streamingEofCandidateConverter_.store(nullptr, std::memory_order_release);
+    ControlScope lock(*this);
     const bool directSelection =
         epoch != 0 && directSelectionArmEpoch_.load(std::memory_order_acquire) == epoch;
     const bool transportSkip =
         epoch != 0 && transportSkipArmEpoch_.load(std::memory_order_acquire) == epoch;
+    if (epoch && !directSelection && !transportSkip) return;
     if (directSelection) {
+        if (!DirectSelectionArmed()) return;
+        directSelectionArmDeadlineTick_.store(GetTickCount64() + kSelectionWindowMs);
         directSelectionSkipEpoch_.store(epoch, std::memory_order_release);
+        selectionAwaitingStart_ = false;
     }
-    ControlScope lock(*this);
-    if (directSelection) selectionAwaitingStart_ = false;
     if (transportSkip) {
         const auto armedGeneration =
             transportSkipArmGeneration_.load(std::memory_order_acquire);
@@ -382,8 +395,9 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
             return;
         }
     }
+    streamingEofCandidateConverter_.store(nullptr, std::memory_order_release);
     if (directSelection) {
-        // A double-click selects and starts the target item even when the old
+        // A row Play or double-click selects and starts the target item even when the old
         // item was paused. Pause intent is generation-scoped; carrying the old
         // true value into the new graph leaves the target permanently Bound
         // while Apple's own timeline is already advancing.
@@ -433,17 +447,33 @@ void AudioCoreRuntime::OnTransportSkip(std::uint64_t epoch) noexcept {
     Wake();
 }
 
-bool AudioCoreRuntime::DirectSelectionPending() const noexcept {
+bool AudioCoreRuntime::DirectSelectionArmed() const noexcept {
     const auto epoch = directSelectionArmEpoch_.load(std::memory_order_acquire);
     const auto generation = boundMediaGeneration_.load(std::memory_order_acquire);
     return epoch != 0 && generation != 0 &&
-        directSelectionSkipEpoch_.load(std::memory_order_acquire) == epoch &&
         directSelectionArmGeneration_.load(std::memory_order_acquire) == generation &&
         GetTickCount64() <= directSelectionArmDeadlineTick_.load(std::memory_order_acquire);
 }
 
-bool AudioCoreRuntime::RetireDirectSelectionLocked() noexcept {
-    if (!DirectSelectionPending()) return false;
+bool AudioCoreRuntime::DirectSelectionPending() const noexcept {
+    const auto epoch = directSelectionSkipEpoch_.load(std::memory_order_acquire);
+    return epoch && epoch == directSelectionArmEpoch_.load(std::memory_order_acquire) &&
+           DirectSelectionArmed();
+}
+
+bool AudioCoreRuntime::ManualOwningStopLocked() const noexcept {
+    if (!DirectSelectionArmed() || endOfStreamDrainPending_ || seekFence_ ||
+        userPauseIntent_ || graphPaused_ || graphControlPending_) return false;
+    const auto converter = boundConverter_.load();
+    if (!converter || streamingEofCandidateConverter_.load() == converter) return false;
+    // A highlighted row need not start a track. When available, require the
+    // player's own queue item to change in addition to the old owner's Stop.
+    return playbackStateAvailable_ && selectionArmItem_ && observedPlaybackItem_ &&
+           selectionArmItem_ != observedPlaybackItem_;
+}
+
+bool AudioCoreRuntime::RetireDirectSelectionLocked(bool owningStop) noexcept {
+    if (!DirectSelectionPending() && !(owningStop && ManualOwningStopLocked())) return false;
     AdvanceEventEpochLocked();
     const auto converter = boundConverter_.load(std::memory_order_acquire);
     // Preserve only an already selected, identity-checked successor. Never
@@ -698,32 +728,19 @@ bool AudioCoreRuntime::OnLocalEndOfStream(void* converter) noexcept {
     // bounded confirmation window before classifying Dispose as natural EOS.
     const auto armedEpoch = directSelectionArmEpoch_.load(std::memory_order_acquire);
     const auto armedDeadline = directSelectionArmDeadlineTick_.load(std::memory_order_acquire);
-    const bool selectionArmLive = armedEpoch != 0 && GetTickCount64() <= armedDeadline;
+    const bool selectionArmLive = boundConverter_.load() == converter && DirectSelectionArmed();
     if (selectionArmLive) {
         const auto waitDeadline = std::min<ULONGLONG>(armedDeadline, GetTickCount64() + 120);
         while (GetTickCount64() <= waitDeadline &&
+               DirectSelectionArmed() && directSelectionArmEpoch_.load() == armedEpoch &&
                directSelectionSkipEpoch_.load(std::memory_order_acquire) != armedEpoch) {
             Sleep(2);
-        }
-        if (directSelectionSkipEpoch_.load(std::memory_order_acquire) == armedEpoch) {
-            return false;
-        }
-    } else if (armedEpoch != 0) {
-        // A completed direct-selection gesture must not poison later natural
-        // EOF classification. Expired arm/skip epochs are cleared before any
-        // later converter retirement is classified.
-        std::uint64_t expected = armedEpoch;
-        if (directSelectionArmEpoch_.compare_exchange_strong(
-                expected, 0, std::memory_order_acq_rel, std::memory_order_acquire)) {
-            directSelectionArmGeneration_.store(0, std::memory_order_release);
-            directSelectionSkipEpoch_.store(0, std::memory_order_release);
-            directSelectionArmDeadlineTick_.store(0, std::memory_order_release);
         }
     }
 
     ControlScope lock(*this);
-    if (selectionArmLive &&
-        directSelectionSkipEpoch_.load(std::memory_order_acquire) == armedEpoch) {
+    if (boundConverter_.load() == converter && (DirectSelectionPending() ||
+        ManualOwningStopLocked())) {
         return false;
     }
     // A non-seek Reset may have already sealed this exact local generation
@@ -764,12 +781,23 @@ void AudioCoreRuntime::RequestLocalSuccessorBind(void* converter) noexcept {
 void AudioCoreRuntime::OnConverterDisposed(void* converter) noexcept {
     if (!UiEnabled() || !converter) return;
     ControlScope lock(*this);
-    registry_.Retire(converter);
-    if (boundConverter_.load(std::memory_order_acquire) == converter &&
-        RetireDirectSelectionLocked()) {
+    const bool owner = boundConverter_.load(std::memory_order_acquire) == converter;
+    if (owner && RetireDirectSelectionLocked(true)) {
+        registry_.Retire(converter);
         Wake();
         return;
     }
+    // Dispose can be the second terminal signal after either scheduler Stop
+    // or a zero-packet Fill. In both orderings, seal before retiring the ID.
+    const bool producerStopped = streamingProducerDrainPending_ && streamingProducerDrainConverter_ == converter;
+    const bool producerEnded = streamingEofCandidateConverter_.load() == converter;
+    if (owner && (producerStopped || producerEnded) && IsP0Converter(converter) &&
+        !seekFence_ && !endOfStreamDrainPending_ &&
+        coordinator_.HasPendingAudio() && BeginEndOfStreamDrainLocked(converter, false)) {
+        streamingProducerDrainPending_ = false;
+        streamingProducerDrainConverter_ = nullptr;
+    }
+    registry_.Retire(converter);
     // A prefetched successor can itself be disposed before becoming bound.
     // Cancel it even in that case, before this address can be reused.
     if (pendingGraphBind_.converter == converter) {
@@ -1067,7 +1095,7 @@ void AudioCoreRuntime::OnAudioUnitStopped(void* unit) noexcept {
         return;
     }
 
-    if (RetireDirectSelectionLocked()) {
+    if (RetireDirectSelectionLocked(true)) {
         graphStarted_ = false;
         if (graphOutputUnit_ == unit) graphOutputUnit_ = nullptr;
         Wake();
@@ -1176,10 +1204,12 @@ bool AudioCoreRuntime::BeforeNativeClientStop(void* client) noexcept {
     if (nativeHandoffPending_.load(std::memory_order_acquire)) return false;
 
     void* converter{};
+    bool quickStop{};
     {
         ControlScope lock(*this);
         if (nativeClient_.load(std::memory_order_acquire) != client) return false;
         if (DirectSelectionPending()) return false;
+        quickStop = ManualOwningStopLocked();
         if (graphControlPending_ || graphPaused_ || userPauseIntent_ || seekFence_ ||
             endOfStreamDrainPending_ || coordinator_.Phase() != AudioCoreGatePhase::Active) {
             return false;
@@ -1198,7 +1228,7 @@ bool AudioCoreRuntime::BeforeNativeClientStop(void* client) noexcept {
     // reservoir; in the observed failing run the missing producer tail was
     // 12,800 frames / 133.3 ms at 96 kHz.
     constexpr ULONGLONG kProducerEofWaitMs = 500;
-    const auto deadline = GetTickCount64() + kProducerEofWaitMs;
+    const auto deadline = GetTickCount64() + (quickStop ? 20u : kProducerEofWaitMs);
     while (GetTickCount64() < deadline) {
         if (!UiEnabled() ||
             boundConverter_.load(std::memory_order_acquire) != converter ||
@@ -1226,7 +1256,7 @@ void* AudioCoreRuntime::OnNativeClientStopped(void* client, HRESULT result) noex
         // graph resume or a real lifecycle retirement arrives.
         return nullptr;
     }
-    if (RetireDirectSelectionLocked()) {
+    if (RetireDirectSelectionLocked(true)) {
         Wake();
         return nullptr;
     }
@@ -1561,6 +1591,12 @@ DWORD AudioCoreRuntime::WorkerMain() noexcept {
                 registry_.RetireAll();
                 continue;
             }
+            if (graphBound_ && !coordinator_.EndpointReleased() &&
+                coordinator_.Sink().ReconfigurationRequested()) {
+                coordinator_.PauseEndpoint();
+                resumePrebufferPending_ = !userPauseIntent_;
+                nextEndpointRetryTick_ = 0;
+            }
             FinalizeEndOfStreamDrainLocked();
             TryBindPendingGraphLocked();
             if (!graphBound_) {
@@ -1659,8 +1695,10 @@ void AudioCoreRuntime::Emit(AudioCoreRuntimeEvent event, HRESULT result) noexcep
     snapshot.reducingBitDepth = coordinator_.IsReducingBitDepth();
     snapshot.sourceMappingExact = coordinator_.IsSourceMappingExact();
     snapshot.converting = coordinator_.IsConverting();
+    snapshot.asio = coordinator_.UsesAsio();
     if (event == AudioCoreRuntimeEvent::Telemetry) snapshot.stats = Stats();
-    else if (event == AudioCoreRuntimeEvent::Faulted)
+    else if (event == AudioCoreRuntimeEvent::Faulted ||
+             (snapshot.asio && event == AudioCoreRuntimeEvent::Active))
         snapshot.stats.sink = coordinator_.Sink().Stats();
     std::lock_guard lock(pendingEventMutex_);
     if (pendingEventCount_ < pendingEvents_.size()) {
@@ -1858,7 +1896,8 @@ void AudioCoreRuntime::TryBindGraphLocked() noexcept {
             static_cast<std::uint16_t>(snapshot.registration.sourceBitDepth)};
     }
     config.sink.endpointId = nativeEndpoint_;
-    config.sink.periodFrames = PeriodFrames(format.sampleRate);
+    config.sink.asioDriverClsid = asioDriverClsid_;
+    config.sink.periodFrames = asioDriverClsid_.empty() ? PeriodFrames(format.sampleRate) : 0;
     config.sink.alignmentRetries = 3;
     config.sink.lifecycleContext = callbacks_.context;
     config.sink.onLifecycle = callbacks_.onSinkLifecycle;
@@ -1957,7 +1996,10 @@ void AudioCoreRuntime::TryResumePausedSinkLocked(bool requireFreshProducer) noex
     resumeProducerPending_ = false;
     const HRESULT resume = coordinator_.ResumeEndpoint();
     if (FAILED(resume)) {
-        if (coordinator_.EndpointReleased()) {
+        if (ammod::audio::IsPlaybackRejection(resume)) {
+            Emit(AudioCoreRuntimeEvent::Faulted, resume);
+            RetireCompletedCaptureLocked(boundConverter_.load());
+        } else if (coordinator_.EndpointReleased()) {
             // A browser/other player can still own the device. Keep the PCM,
             // report a visible wait, and reacquire on a bounded retry cadence.
             resumePrebufferPending_ = true;

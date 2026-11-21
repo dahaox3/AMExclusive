@@ -26,6 +26,7 @@ public:
                       const PcmFormat& output,
                       std::uint32_t maxOutputFrames) noexcept;
     void Reset() noexcept;
+    HRESULT ReserveOutputFrames(std::uint32_t frames) noexcept;
 
     HRESULT Prepare(std::uint32_t capacityFrames) noexcept override;
     bool CanProvide(std::uint32_t capacityFrames) const noexcept override;

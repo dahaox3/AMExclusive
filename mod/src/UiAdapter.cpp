@@ -3,6 +3,7 @@
 #include "IpcTransport.h"
 #include "UiRefreshState.h"
 #include "UiPlaybackState.h"
+#include "TrackSelectionGesture.h"
 
 #include <windows.h>
 
@@ -18,6 +19,7 @@
 #include <winrt/Microsoft.UI.Xaml.Controls.h>
 #include <winrt/Microsoft.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Microsoft.UI.Xaml.Input.h>
+#include <winrt/Microsoft.UI.Input.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Data.h>
 #include <winrt/Microsoft.UI.Dispatching.h>
@@ -171,8 +173,8 @@ std::wstring ErrorText(ErrorCategory category) {
             L"The DAC supports none of the bit-perfect depth combinations required by this source; playback was stopped and the audio load was cleared");
     case ErrorCategory::ExclusiveFormatUnavailable:
         return Localized(
-            L"尝试兼容格式转换后，仍未找到设备支持的 WASAPI 独占输出格式；已停止当前播放",
-            L"No supported WASAPI exclusive format was found after sample-rate and bit-depth conversion; playback was stopped");
+            L"所选设备不支持可用的输出格式，已停止当前播放",
+            L"The selected device has no supported output format. Playback was stopped.");
     case ErrorCategory::FormatUnsupported:
         return Localized(
             L"Apple 当前共享渲染格式无法直接用于独占输出；这不代表设备不支持独占",
@@ -1448,31 +1450,36 @@ void AttachTransportObservers(const Xaml::Window& window, const std::wstring& wi
                     box_value(Input::PointerEventHandler(
                         [](auto&&, Input::PointerRoutedEventArgs const& args) {
                             ScheduleTransportObserverAttach();
+                            const auto point = args.GetCurrentPoint(nullptr);
+                            if (!point.Properties().IsLeftButtonPressed()) return;
                             auto current = args.OriginalSource().try_as<Xaml::DependencyObject>();
+                            bool playButton = false;
                             for (unsigned depth = 0; current && depth < 16; ++depth) {
+                                if (auto button = current.try_as<Primitives::ButtonBase>()) {
+                                    playButton = ammod::ui::IsRowPlayButton(
+                                        Automation::AutomationProperties::GetAutomationId(button),
+                                        button.Name(), Automation::AutomationProperties::GetName(button));
+                                    if (!playButton) {
+                                        g_lastTrackRowPressEpoch = g_lastTrackRowPressIdentity = 0;
+                                        return;
+                                    }
+                                }
                                 if (auto row = current.try_as<Controls::ListViewItem>()) {
                                     const auto rowIdentity = DependencyObjectIdentity(row);
                                     const auto now = GetTickCount64();
-                                    const bool secondPress = rowIdentity != 0 &&
-                                        rowIdentity == g_lastTrackRowPressIdentity &&
-                                        now >= g_lastTrackRowPressTick &&
-                                        now - g_lastTrackRowPressTick <= 650;
+                                    const bool secondPress = !playButton && rowIdentity &&
+                                        g_lastTrackRowPressEpoch && rowIdentity == g_lastTrackRowPressIdentity &&
+                                        now - g_lastTrackRowPressTick <= GetDoubleClickTime();
                                     if (secondPress) {
-                                        const auto epoch = g_lastTrackRowPressEpoch;
-                                        g_lastTrackRowPressIdentity = 0;
-                                        g_lastTrackRowPressEpoch = 0;
-                                        g_lastTrackRowPressTick = 0;
-                                        if (epoch != 0) QueueTransport(L"skip", epoch);
-                                    } else {
+                                        QueueTransport(L"skip", g_lastTrackRowPressEpoch);
+                                        g_lastTrackRowPressEpoch = g_lastTrackRowPressIdentity = 0;
+                                    } else if (StatusSnapshot().enabledIntent) {
+                                        const auto epoch = g_transportEpoch.fetch_add(1) + 1;
+                                        QueueTransport(L"selection_arm", epoch);
+                                        if (playButton) QueueTransport(L"skip", epoch);
+                                        g_lastTrackRowPressEpoch = playButton ? 0 : epoch;
                                         g_lastTrackRowPressIdentity = rowIdentity;
                                         g_lastTrackRowPressTick = now;
-                                        g_lastTrackRowPressEpoch = 0;
-                                        if (StatusSnapshot().state == RuntimeState::Active) {
-                                            const auto epoch =
-                                                g_transportEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-                                            g_lastTrackRowPressEpoch = epoch;
-                                            QueueTransport(L"selection_arm", epoch);
-                                        }
                                     }
                                     break;
                                 }
@@ -1806,8 +1813,8 @@ bool AttachOrRefreshToggle(const Xaml::DependencyObject& page) {
             toggle, Localized(L"独占模式", L"Exclusive mode"));
         Automation::AutomationProperties::SetHelpText(
             toggle,
-            Localized(L"尝试在当前默认播放设备上启用 WASAPI 独占输出",
-                      L"Try to use WASAPI exclusive output on the current default playback device"));
+            Localized(L"启用所选设备的独占输出",
+                      L"Enable exclusive output on the selected device"));
         toggle.Toggled([](winrt::Windows::Foundation::IInspectable const& sender,
                           Xaml::RoutedEventArgs const&) {
           try {
@@ -1857,8 +1864,8 @@ bool AttachOrRefreshToggle(const Xaml::DependencyObject& page) {
         title.Text(Localized(L"独占模式", L"Exclusive mode"));
         Controls::TextBlock description;
         description.Text(Localized(
-            L"对当前默认播放设备使用 WASAPI 独占输出。",
-            L"Use WASAPI exclusive output on the current default playback device."));
+            L"使用输出设备菜单中选定的 WASAPI 独占设备或 ASIO 驱动。",
+            L"Use the WASAPI exclusive device or ASIO driver selected in the output menu."));
         description.TextWrapping(Xaml::TextWrapping::Wrap);
         Controls::TextBlock statusText;
         statusText.Name(L"AMExclusiveModeStatus");
@@ -2015,8 +2022,8 @@ bool AttachOrRefreshToggle(const Xaml::DependencyObject& page) {
         bufferTitle.Text(Localized(L"硬件缓冲区", L"Hardware buffer"));
         Controls::TextBlock bufferDescription;
         bufferDescription.Text(Localized(
-            L"设置 WASAPI 独占输出的硬件缓冲时长（毫秒）。",
-            L"Set the WASAPI exclusive hardware buffer duration in milliseconds."));
+            L"设置 WASAPI 独占缓冲时长（毫秒）。ASIO 使用驱动控制面板中的缓冲大小。",
+            L"Set the WASAPI exclusive buffer in milliseconds. ASIO uses the driver's preferred buffer size."));
         bufferDescription.TextWrapping(Xaml::TextWrapping::Wrap);
         if (!nativeText.empty()) bufferTitle.Style(nativeText[0].Style());
         if (nativeText.size() > 1) bufferDescription.Style(nativeText[1].Style());
