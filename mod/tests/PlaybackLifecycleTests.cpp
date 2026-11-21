@@ -9,6 +9,40 @@ void Check(bool condition, const char* label) {
 }
 
 namespace ammod::audio_v2 {
+// A hardware-free endpoint for replaying the production activation path. Read
+// one real PCM packet so a successful bind alone cannot satisfy this test.
+class CaptureEndpoint final : public IPlaybackSink {
+public:
+    HRESULT Open(const WasapiSinkConfig& config) noexcept override {
+        format = config.format;
+        state = WasapiSinkState::Open;
+        return S_OK;
+    }
+    HRESULT Start(IIntegerPcmSource& source) noexcept override {
+        bool eof{};
+        std::uint32_t count{};
+        if (source.Prepare(2) != S_OK || source.Fill(stereo.data(), 2, count, eof) != S_OK || count != 2)
+            return E_FAIL;
+        state = WasapiSinkState::Running;
+        return S_OK;
+    }
+    HRESULT DrainAndClose() noexcept override { Close(); return S_OK; }
+    void Stop() noexcept override { state = WasapiSinkState::Open; }
+    void Close() noexcept override { state = WasapiSinkState::Closed; }
+    WasapiSinkState State() const noexcept override { return state; }
+    WasapiSinkStats Stats() const noexcept override { return {}; }
+    const PcmFormat& Format() const noexcept override { return format; }
+    std::uint32_t BufferFrames() const noexcept override { return 2; }
+    bool WaitingForSource() const noexcept override { return false; }
+    bool EndOfStreamSubmitted() const noexcept override { return false; }
+    bool EndOfStreamComplete() const noexcept override { return false; }
+    void SetResumeBlocked(bool) noexcept override {}
+    std::array<std::int32_t, 4> stereo{};
+private:
+    PcmFormat format{};
+    WasapiSinkState state{WasapiSinkState::Closed};
+};
+
 struct AudioCoreRuntimeRegression {
     static void Register(AudioCoreRuntime& r, void* converter, unsigned rate = 96000) {
         ConverterRegistration item{};
@@ -44,6 +78,72 @@ struct AudioCoreRuntimeRegression {
                                       8, 1, 8, 2, 32, rate};
         const ApplePcmBufferView buffer{2, sizeof(samples), samples};
         Check(r.OnPcmOutput(converter, format, {1, &buffer}, 2), "capture known PCM frames");
+    }
+    static void NaturalHandoffAfterTeardown() {
+        // 96 kHz -> 48 kHz, as observed on Apple Music 1.7. The old child is
+        // uninitialized and reused; only the hardware parent gets Start.
+        for (const bool producerBusy : {false, true}) {
+            for (const bool reuseParent : {false, true}) {
+                CaptureEndpoint output;
+                AudioCoreRuntime r;
+                auto& c = r.coordinator_;
+                const auto old = reinterpret_cast<void*>(0x4100);
+                const auto next = reinterpret_cast<void*>(0x4200);
+                const auto parent = reinterpret_cast<void*>(0x4300);
+                const auto nextParent = reuseParent ? parent : reinterpret_cast<void*>(0x4600);
+                const auto oldClient = reinterpret_cast<void*>(0x4400);
+                const auto nextClient = reinterpret_cast<void*>(0x4500);
+                Register(r, old); Bind(r, old);
+                const auto child = r.graphUnit_;
+                r.OnAudioUnitStarted(parent);
+                r.OnNativeClientStarted(oldClient, S_OK);
+                Pcm(r, old, 96000);
+                Check(c.gate_.MarkPrebuffered(c.token_) && c.outputGate_.CommitCutover(c.token_),
+                      "fixture has an active old track");
+                Register(r, next, 48000);
+                Check(r.OnStreamingProducerEndOfStream(old), "old source reached EOF");
+                r.OnNativeClientStopped(oldClient, S_OK);
+                r.OnAudioUnitStopped(parent);
+                r.OnAudioUnitUninitialized(child);
+                r.OnConverterDisposed(old);
+                r.OnAudioUnitInitialized(child, next, 48000, 2, 24, 1);
+                Pcm(r, next, 48000);
+                bool leaseAvailable = !producerBusy;
+                r.callbacks_.context = &leaseAvailable;
+                r.callbacks_.tryAcquireProducer = [](void* ctx) noexcept { return *static_cast<bool*>(ctx); };
+                if (producerBusy) {
+                    r.endOfStreamDrainRemainingMs_ = 0;
+                    r.FinalizeEndOfStreamDrainLocked();
+                    Check(!r.graphBound_ && r.pendingGraphBind_.converter == next,
+                          "pending child waits for the producer lease after drain");
+                }
+                if (!reuseParent) r.OnNativeClientStarted(nextClient, S_OK);
+                r.OnAudioUnitStarted(nextParent);
+                if (reuseParent) r.OnNativeClientStarted(nextClient, S_OK);
+                else r.OnAudioUnitStarted(parent); // a second, unrelated Start cannot steal this parent
+                if (!producerBusy) {
+                    Check(r.BoundConverter() == old, "parent Start preserves the old draining tail");
+                    r.endOfStreamDrainRemainingMs_ = 0;
+                    r.FinalizeEndOfStreamDrainLocked();
+                } else {
+                    leaseAvailable = true;
+                    r.TryBindPendingGraphLocked();
+                }
+                Check(r.BoundConverter() == next && r.graphStarted_ && r.graphOutputUnit_ == nextParent,
+                      "parent-only Start survives old child teardown and drain");
+                c.sink_.store(&output);
+                r.callbacks_.prepareNativeHandoff = [](void*, void*) noexcept { return S_OK; };
+                r.callbacks_.nativeHandoffPreservesScheduling = true;
+                std::array<float, kMaxBlockSamples> pcm{};
+                for (unsigned n = 0; n < 3; ++n)
+                    Check(c.PushP0Interleaved(2 + n * kMaxBlockFrames, pcm.data(), kMaxBlockFrames, false, false),
+                          "real prebuffer for the successor");
+                r.TryActivateLocked();
+                Check(c.Phase() == AudioCoreGatePhase::Active && output.Format().sampleRate == 48000 &&
+                      output.stereo == std::array<std::int32_t, 4>{0x20000000, -0x20000000, 0x40000000, -0x40000000},
+                      "48 kHz endpoint starts and receives the original successor stereo samples");
+            }
+        }
     }
     static void PredecodeCases() {
         const auto decoder = reinterpret_cast<void*>(0x1000);
@@ -134,6 +234,11 @@ struct AudioCoreRuntimeRegression {
                 r.OnTransportSkip(10);
                 r.TryBindPendingGraphLocked();
                 Check(!r.graphBound_, "Next alone cannot choose an unconfirmed prefetched target");
+                const auto oldParent = r.graphOutputUnit_;
+                r.OnAudioUnitStarted(reinterpret_cast<void*>(0x9990));
+                Check(!r.graphBound_ && r.pendingGraphBind_.awaitingSelectionStart &&
+                      r.graphOutputUnit_ == oldParent,
+                      "an unrelated parent cannot confirm a manual selection or replace its old output");
             }
             r.OnAudioUnitStarted(nextUnit);
             if (!confirmBeforeStart) r.OnTransportSkip(10);
@@ -348,6 +453,7 @@ struct AudioCoreRuntimeRegression {
     }
 
     static void Run() {
+        NaturalHandoffAfterTeardown();
         ManualAndDisposeCases();
         PredecodeCases();
         const auto decoder = reinterpret_cast<void*>(0x1000);

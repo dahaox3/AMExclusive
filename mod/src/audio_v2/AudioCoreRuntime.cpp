@@ -1028,10 +1028,19 @@ void AudioCoreRuntime::OnAudioUnitStarted(void* unit) noexcept {
     ControlScope lock(*this);
     const bool knownPendingUnit = unit && (pendingGraphBind_.unit == unit ||
                                            pendingGraphBind_.outputUnit == unit);
+    // A natural handoff can tear down the old child before the successor's
+    // parent-only Start. Its decoder registration and PCM are already staged,
+    // but final drain (or the producer lease) still prevents promotion.
+    const bool oldOutputStopped = !graphBound_ || (!graphStarted_ &&
+        (endOfStreamDrainPending_ || streamingProducerDrainPending_));
+    const bool pendingParent = unit && unit != graphUnit_ &&
+        !pendingGraphBind_.awaitingSelectionStart &&
+        (!pendingGraphBind_.outputUnit || !pendingGraphBind_.started) &&
+        (oldOutputStopped || (graphStarted_ && unit != graphOutputUnit_));
     const bool pendingStart = pendingGraphBind_.preservesCurrentGraph &&
-        (knownPendingUnit ||
-         (graphBound_ && graphStarted_ && unit && unit != graphUnit_ &&
-          unit != graphOutputUnit_));
+        (knownPendingUnit || pendingParent);
+    if (pendingGraphBind_.preservesCurrentGraph && !pendingStart &&
+        unit != graphUnit_ && unit != graphOutputUnit_) return;
     if (pendingStart) {
         // Some Apple graphs start only their hardware-output parent. Associate
         // that edge with the pending child instead of replacing the live parent.

@@ -4,6 +4,8 @@
 
 # AMExclusive
 
+**0.3.5 fixes silence after a natural track change.** Apple Music can start the next song's hardware output while AMExclusive is still draining the previous song. The player now retains that start through the handoff, including when the two songs use different sample rates.
+
 **0.3.4 adds ASIO output, manual track selection and a streaming tail fix.** Choose the installed x64 driver under **Output device → [ASIO]**. Each song opens the driver at the selected Apple source rate. The driver supplies the channel format, preferred buffer size and output latency each time it opens. Pause frees the driver for other apps. A driver reset or buffer-size change during playback triggers renegotiation. The default Apple lossless source ceiling is 96 kHz. Local rate conversion remains opt-in.
 
 Row Play, double-click and a queue-item change after a single click identify manual selection. A natural streaming stop followed by early decoder disposal drains already captured PCM through the output before handing off to the next song.
